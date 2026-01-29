@@ -5,7 +5,7 @@ from scipy.interpolate import griddata
 import xarray as xr
 from metpy.interpolate import inverse_distance_to_grid
 from functools import reduce
-import maskout
+from . import maskout
 import cartopy.crs as ccrs
 from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER

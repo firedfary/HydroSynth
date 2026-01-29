@@ -171,8 +171,8 @@ class UNetLiteFiLM(nn.Module):
 
 if __name__ == "__main__":
     # sanity check
-    model = UNetLiteFiLM(n_channels=10, n_classes=1, index_dim=3)
-    x = torch.randn(2, 10, 128, 128)
+    model = UNetLiteFiLM(n_channels=10, n_classes=1, index_dim=3, base_filters=16)
+    x = torch.randn(2, 10, 120, 140)
     indices = torch.randn(2, 3)  # 3 global indices (e.g., 3 EOF PCs)
     out = model(x, indices)
     print("Output shape:", out.shape)  # expect [2,1,128,128]

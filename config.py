@@ -10,7 +10,7 @@ save_weight_foldr = 'weight_'
 picture_foldr = 'picture'
 log_foldr = 'log_'
 
-local_data_path = 'E:/D1/diffusion/my_models/UNet_data/'
+local_data_path = './datas/UNet_3D_data/'
 colab_data_path = '/content/drive/MyDrive/my_models/my_model_data/'
 
 if os.name == 'nt':

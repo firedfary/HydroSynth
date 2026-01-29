@@ -2,8 +2,16 @@ import torch
 import os
 import tqdm
 import numpy as np
-import fucs
-import config
+import sys
+
+# Ensure project root is on sys.path so absolute imports like 'HydroSynth' work
+_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_proj_root = os.path.normpath(_proj_root)
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
+
+from HydroSynth.utils import utils
+from HydroSynth import config
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.decomposition import PCA
@@ -181,7 +189,7 @@ def train():
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.modelconfig["grad_clip"])
             optimizer.step()
 
-            acc = sum([fucs.cal_acc(out[:,i]*100, x_0[:,i]*100).mean() for i in range(t)])/t
+            acc = sum([utils.cal_acc(out[:,i]*100, x_0[:,i]*100).mean() for i in range(t)])/t
             train_losses.append(loss.item())
             train_accs.append(acc.item())
 
@@ -211,7 +219,7 @@ def train():
 
                 out[mask] = float("nan")
                 loss = loss_fn(out[~mask], x_0[~mask])
-                acc = sum([fucs.cal_acc(out[:,i]*100, x_0[:,i]*100).mean() for i in range(t)])/t
+                acc = sum([utils.cal_acc(out[:,i]*100, x_0[:,i]*100).mean() for i in range(t)])/t
                 test_losses.append(loss.item())
                 test_accs.append(acc.item())
 
