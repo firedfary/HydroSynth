@@ -10,7 +10,7 @@ save_weight_foldr = 'weight_'
 picture_foldr = 'picture'
 log_foldr = 'log_'
 
-local_data_path = './datas/UNet_3D_data/'
+local_data_path = 'e:/D1/diffusion/HydroSynth/datas/UNet_3D_data/'
 colab_data_path = '/content/drive/MyDrive/my_models/my_model_data/'
 
 if os.name == 'nt':
@@ -61,7 +61,7 @@ modelconfig = {
         'cond_dim': 10,
         "test_ratio": 0.2,
         "seed": 42,
-        "n_pcs": 5,
+        "n_pcs": 10,
         'pc_window': 3,
         'pc_step': 1,
         'horizon': 6

@@ -162,7 +162,8 @@ def train():
     for e in range(config.modelconfig["epoch"]):
         # --- train ---
         model.train()
-        train_losses, train_accs = [], []
+        train_losses = []
+        train_accs_by_t = {i: [] for i in range(6)}  # 为每个时间步分别记录
         for x_0, cond, mask, pcs in tqdm.tqdm(train_loader, desc=f"Train {e}"):
             x_0, cond, mask, pcs = x_0.to(device), cond.to(device), mask.to(device), pcs.to(device)
             B, C, t, H, W = cond.shape
@@ -189,18 +190,24 @@ def train():
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.modelconfig["grad_clip"])
             optimizer.step()
 
-            acc = sum([utils.cal_acc(out[:,i]*100, x_0[:,i]*100).mean() for i in range(t)])/t
             train_losses.append(loss.item())
-            train_accs.append(acc.item())
+            # 为每个时间步分别计算精度
+            for i in range(t):
+                acc_i = utils.cal_acc(out[:,i]*100, x_0[:,i]*100).mean()
+                train_accs_by_t[i].append(acc_i.item())
 
         scheduler.step()
-        avg_train_loss, avg_train_acc = np.mean(train_losses), np.mean(train_accs)
+        avg_train_loss = np.mean(train_losses)
         writer.add_scalar("Loss/train", avg_train_loss, e)
-        writer.add_scalar("Acc/train", avg_train_acc, e)
+        # 为每个时间步单独记录精度
+        for i in range(6):
+            avg_acc_i = np.mean(train_accs_by_t[i])
+            writer.add_scalar(f"Acc/train_t{i}", avg_acc_i, e)
 
         # --- test ---
         model.eval()
-        test_losses, test_accs = [], []
+        test_losses = []
+        test_accs_by_t = {i: [] for i in range(6)}  # 为每个时间步分别记录
         with torch.no_grad():
             for x_0, cond, mask, pcs in tqdm.tqdm(test_loader, desc=f"Test {e}"):
                 x_0, cond, mask, pcs = x_0.to(device), cond.to(device), mask.to(device), pcs.to(device)
@@ -219,14 +226,22 @@ def train():
 
                 out[mask] = float("nan")
                 loss = loss_fn(out[~mask], x_0[~mask])
-                acc = sum([utils.cal_acc(out[:,i]*100, x_0[:,i]*100).mean() for i in range(t)])/t
                 test_losses.append(loss.item())
-                test_accs.append(acc.item())
+                # 为每个时间步分别计算精度
+                for i in range(t):
+                    acc_i = utils.cal_acc(out[:,i]*100, x_0[:,i]*100).mean()
+                    test_accs_by_t[i].append(acc_i.item())
 
-        avg_test_loss, avg_test_acc = np.mean(test_losses), np.mean(test_accs)
+        avg_test_loss = np.mean(test_losses)
         writer.add_scalar("Loss/test", avg_test_loss, e)
-        writer.add_scalar("Acc/test", avg_test_acc, e)
+        # 为每个时间步单独记录精度
+        for i in range(6):
+            avg_acc_i = np.mean(test_accs_by_t[i])
+            writer.add_scalar(f"Acc/test_t{i}", avg_acc_i, e)
 
+        # 计算平均精度用于打印
+        avg_train_acc = np.mean([np.mean(train_accs_by_t[i]) for i in range(6)])
+        avg_test_acc = np.mean([np.mean(test_accs_by_t[i]) for i in range(6)])
         print(f"Epoch {e}: TrainLoss={avg_train_loss:.4f}, TestLoss={avg_test_loss:.4f}, "
               f"TrainAcc={avg_train_acc:.3f}, TestAcc={avg_test_acc:.3f}")
 
