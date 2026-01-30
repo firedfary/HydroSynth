@@ -70,6 +70,7 @@ modelconfig = {
         "test_ratio": 0.2,
         "seed": 42,
         "n_pcs": 10,
+        "n_pcs": 10,
         'pc_window': 3,
         'pc_step': 1,
         'horizon': 6
