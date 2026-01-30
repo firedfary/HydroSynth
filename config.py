@@ -6,9 +6,9 @@ import json
 #1是训练集，2是测试集
 lr_foldr = 'lr_unet'
 hr_foldr = 'hr_unet'
-save_weight_foldr = 'weight_'
+save_weight_foldr = 'weight_t0'
 picture_foldr = 'picture'
-log_foldr = 'log_'
+log_foldr = 'log_ind'
 
 local_data_path = 'e:/D1/diffusion/HydroSynth/datas/UNet_3D_data/'
 colab_data_path = '/content/drive/MyDrive/my_models/my_model_data/'
