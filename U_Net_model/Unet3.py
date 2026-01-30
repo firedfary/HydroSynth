@@ -6,7 +6,6 @@ if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
 import torch
-from datetime import datetime
 import tqdm
 import numpy as np
 from HydroSynth.utils import utils
@@ -58,7 +57,7 @@ def prepare_data():
     target_file = config.modelconfig["hr_path"] + "/hr_data1.npy"
     target = np.load(target_file).astype(np.float32)  # [T,H,W]
     target = np.expand_dims(target, 1)  # [T,1,H,W]
-    target_t = torch.from_numpy(target)[:,:,5]
+    target_t = torch.from_numpy(target)
     mask_t = torch.isnan(target_t)
 
     # --- condition (10-channel climate fields) ---
@@ -68,7 +67,7 @@ def prepare_data():
     #     Tdim = cond.shape[0]
     #     cond = cond.reshape(Tdim, -1, cond.shape[-2], cond.shape[-1])
     #     print("Reshaped 5D condition:", cond.shape)
-    cond_t = torch.from_numpy(cond)[:,:,5]
+    cond_t = torch.from_numpy(cond)
 
     # --- PCs from SST ---
     sst_path = config.modelconfig["sst_file"]
@@ -132,9 +131,8 @@ def train():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.modelconfig["epoch"], eta_min=0
     )
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs(os.path.join(config.modelconfig["log_path"], f"run_{run_id}"), exist_ok=True)
-    writer = SummaryWriter(os.path.join(config.modelconfig["log_path"], f"run_{run_id}"))
+
+    writer = SummaryWriter(config.modelconfig["log_path"])
 
     best_test_loss = float("inf")
     for e in range(config.modelconfig["epoch"]):

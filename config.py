@@ -1,6 +1,7 @@
 import torch
 import os
 import json
+from datetime import datetime
 
 # print('current platform: ', os.name)
 #1是训练集，2是测试集
@@ -10,7 +11,7 @@ save_weight_foldr = 'weight_t0'
 picture_foldr = 'picture'
 log_foldr = 'log_ind'
 
-local_data_path = 'e:/D1/diffusion/HydroSynth/datas/UNet_3D_data/'
+local_data_path = 'e:/D1/diffusion/HydroSynth/datas/UNet_data/'
 colab_data_path = '/content/drive/MyDrive/my_models/my_model_data/'
 
 if os.name == 'nt':
@@ -34,6 +35,13 @@ if not os.path.exists(save_weight_path):
     os.makedirs(save_weight_path)
 if not os.path.exists(picture_save_path):
     os.makedirs(picture_save_path)
+if not os.path.exists(log_path):
+    os.makedirs(log_path)
+
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+os.makedirs(os.path.join(log_path, f"run_{run_id}"), exist_ok=True)
+os.makedirs(os.path.join(picture_save_path, f"run_{run_id}"), exist_ok=True)
+os.makedirs(os.path.join(save_weight_path, f"run_{run_id}"), exist_ok=True)
 
 modelconfig = {
         'device': torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
@@ -44,11 +52,11 @@ modelconfig = {
         'atten': [0,1,2,3],
         'num_res_block': 6,
         'dropout': 0.6,
-        'save_weight_path': save_weight_path,
+        'save_weight_path': os.path.join(save_weight_path, f"run_{run_id}"),
         'train_load_weight': None,
         'eval_load_weight': 'ckptunet_1.pt',
-        'picture_save_path': picture_save_path,
-        'log_path': log_path,
+        'picture_save_path': os.path.join(picture_save_path, f"run_{run_id}"),
+        'log_path': os.path.join(log_path, f"run_{run_id}"),
         'lr': 0.0005,
         'epoch': 502,
         'multiplier': 1.0,
@@ -66,6 +74,9 @@ modelconfig = {
         'pc_step': 1,
         'horizon': 6
     }
+
+
+
 
 def load_config(json_file_path=None, merge_mode='update'):
     """
@@ -118,3 +129,59 @@ def load_config(json_file_path=None, merge_mode='update'):
     print(f"合并模式: {merge_mode}")
     
     return modelconfig
+
+
+def save_config(config_dict=None, file_path=None, indent=4):
+    """
+    将配置字典保存为JSON格式文件
+    
+    Args:
+        config_dict (dict): 要保存的配置字典，默认为modelconfig
+        file_path (str): 保存文件的路径，默认为save_weight_path中的config_{run_id}.json
+        indent (int): JSON缩进空格数
+    
+    Returns:
+        str: 保存的配置文件路径
+    """
+    if config_dict is None:
+        config_dict = modelconfig
+    
+    # 处理无法序列化的对象（如torch.device）
+    serializable_config = {}
+    for key, value in config_dict.items():
+        if isinstance(value, torch.device):
+            # 将torch.device转换为字符串表示
+            serializable_config[key] = str(value)
+        elif isinstance(value, (list, dict, int, float, str, bool)) or value is None:
+            # 基本类型可以直接序列化
+            serializable_config[key] = value
+        else:
+            # 其他类型转换为字符串
+            serializable_config[key] = str(value)
+    
+    # 默认保存路径
+    if file_path is None:
+        file_path = os.path.join(modelconfig['save_weight_path'], f'config_{run_id}.json')
+    
+    # 确保目录存在
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_config, f, indent=indent, ensure_ascii=False)
+        print(f"配置已保存到: {file_path}")
+        return file_path
+    except Exception as e:
+        raise RuntimeError(f"保存配置文件失败: {e}")
+
+
+# 在模块加载时自动保存配置
+def _auto_save_config():
+    """自动保存配置到save_weight_path"""
+    try:
+        save_config()
+    except Exception as e:
+        print(f"自动保存配置失败: {e}")
+
+# 模块导入时自动执行
+_auto_save_config()
