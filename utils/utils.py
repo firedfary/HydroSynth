@@ -283,7 +283,7 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
 
 
 
-def read_nc_to_npy(start: int, end: int) -> list:
+def read_nc_to_npy(start: int, end: int, data_path: str = "E:\D1\data\MODESv21_ecmwf_seas51") -> list:
     start_year = int(str(start)[0:4])
     end_year = int(str(end)[0:4])
     start_month = int(str(start)[4:6])
@@ -293,21 +293,21 @@ def read_nc_to_npy(start: int, end: int) -> list:
 
     if start_year == end_year:
         for i in range(start_month, end_month + 1):
-            file_name = rf"E:\D1\data\ECMWF\MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
+            file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
             file_name_list.append(file_name)
     else:
         # 起始年
         for i in range(start_month, 13):
-            file_name = rf"E:\D1\data\ECMWF\MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
+            file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
             file_name_list.append(file_name)
         # 跨年
         for year in range(start_year + 1, end_year):
             for month in range(1, 13):
-                file_name = rf"E:\D1\data\ECMWF\MODESv21_ecmwf_seas51_{year}{str(month).zfill(2)}_monthly_em.nc"
+                file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{year}{str(month).zfill(2)}_monthly_em.nc"
                 file_name_list.append(file_name)
         # 结束年
         for i in range(1, end_month + 1):
-            file_name = rf"E:\D1\data\ECMWF\MODESv21_ecmwf_seas51_{end_year}{str(i).zfill(2)}_monthly_em.nc"
+            file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{end_year}{str(i).zfill(2)}_monthly_em.nc"
             file_name_list.append(file_name)
 
     print('total month', len(file_name_list))

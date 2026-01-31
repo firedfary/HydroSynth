@@ -62,7 +62,7 @@ def prepare_data():
     mask_t = torch.isnan(target_t)
 
     # --- condition (10-channel climate fields) ---
-    cond_file = config.modelconfig["lr_path"] + "/lr_data1.npy"
+    cond_file = config.modelconfig["lr_path"] + "/lr_data_lead0_3.npy"
     cond = np.load(cond_file).astype(np.float32)  # [T,C,H,W]
     # if cond.ndim == 5:
     #     Tdim = cond.shape[0]
