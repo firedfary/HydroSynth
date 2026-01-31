@@ -177,7 +177,7 @@ def save_config(config_dict=None, file_path=None, indent=4):
 
 
 # 在模块加载时自动保存配置
-def _auto_save_config():
+def auto_save_config():
     """自动保存配置到save_weight_path"""
     try:
         save_config()
@@ -185,4 +185,4 @@ def _auto_save_config():
         print(f"自动保存配置失败: {e}")
 
 # 模块导入时自动执行
-_auto_save_config()
+# _auto_save_config()

@@ -10,6 +10,7 @@ import tqdm
 import numpy as np
 from HydroSynth.utils import utils
 import config
+config.auto_save_config()
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.decomposition import PCA
