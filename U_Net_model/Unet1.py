@@ -1,14 +1,20 @@
+import sys
+import os
+_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_proj_root = os.path.normpath(_proj_root)
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
 import torch
 import os
 import warmup_scheduler
 import tqdm
 import numpy as np
-import fucs
+from HydroSynth.utils import utils
 import config
-from torch.utils.tensorboard import SummaryWriter  # 取消注释导入
+# config.auto_save_config()
+from torch.utils.tensorboard import SummaryWriter
 from unetlite import UNetLite
-from unet_model import UNet
-from unetsmall import UNetSmall
+
 
 
 
@@ -31,15 +37,15 @@ def train():
     device = torch.device(config.modelconfig["device"])
     target_file_dir = config.modelconfig["hr_path"]
 
-    target_data = target_file_dir+'/hr_data1.npy'
-    target_data = torch.tensor(np.load(target_data), dtype=torch.float32)
-    target_data = torch.unsqueeze(target_data, dim=1)
-    # target_data = target_data.view(-1, 1, 120, 140)#51786,1,32,32
+    target_data = target_file_dir+'/hr_dataf1.npy'
+    target_data = np.load(target_data).astype(np.float32)
+    target_data = np.expand_dims(target_data, 1)
+    target_data = torch.from_numpy(target_data)  # 使用from_numpy而不是tensor()
     data_mask = torch.isnan(target_data)
 
     model_file_dir = config.modelconfig["lr_path"]
-    model_data = np.load(model_file_dir+'/lr_data1.npy')
-    condition = torch.tensor(model_data)#189,274,10,32,32
+    model_data = np.load(model_file_dir+'/lr_data_lead0_f1.npy').astype(np.float32)
+    condition = torch.from_numpy(model_data)  # 使用from_numpy而不是tensor()
     # condition = condition.view(-1, 10, 120, 140)#51786,10,32,32
 
     # ============= 修改：直接在展平后的数据上分割测试集 =============
@@ -69,7 +75,7 @@ def train():
         dataset=train_dataset,
         batch_size=config.modelconfig["batch_size"],
         shuffle=True,
-        num_workers=4,
+        num_workers=0,  # Windows上应使用0避免多进程开销
         drop_last=True,
         pin_memory=True
     )
@@ -78,12 +84,12 @@ def train():
         dataset=test_dataset,
         batch_size=config.modelconfig["batch_size"],
         shuffle=False,  # 测试集不需要shuffle
-        num_workers=2,
+        num_workers=0,  # Windows上应使用0避免多进程开销
         pin_memory=True
     )
     # ===========================================================
 
-    model = UNetLite(n_channels=10, n_classes=1)
+    model = UNetLite(n_channels=7, n_classes=1)
     if config.modelconfig["train_load_weight"] is not None:
         model.load_state_dict(torch.load(os.path.join(
             config.modelconfig["save_weight_path"],
@@ -136,7 +142,7 @@ def train():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.modelconfig["grad_clip"])
                 optimizer.step()
-                Acc = fucs.cal_acc(output[:,0,:,:]*100, x_0[:,0,:,:]*100).mean()
+                Acc = utils.cal_acc(output[:,0,:,:]*100, x_0[:,0,:,:]*100).mean()
                 train_Acc.append(Acc.item())
                 train_losses.append(loss.item())
                 tqdmDataLoader.set_postfix(ordered_dict={
@@ -179,7 +185,7 @@ def train():
                     # loss = (diff**2).sum() / (~mask).sum()
 
                     test_losses.append(loss.item())
-                    Acc = fucs.cal_acc(output[:,0,:,:]*100, x_0[:,0,:,:]*100).mean()
+                    Acc = utils.cal_acc(output[:,0,:,:]*100, x_0[:,0,:,:]*100).mean()
                     test_Acc.append(Acc.item())
                     test_tqdm.set_postfix(ordered_dict={
                         "test_loss": loss.item()
@@ -214,5 +220,6 @@ def train():
 
 
 if __name__ == '__main__':
+    config.auto_save_config()
     train()
     # os.system("shutdown -s -t 0 ")
