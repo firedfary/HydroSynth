@@ -11,8 +11,11 @@ save_weight_foldr = 'weight_t0'
 picture_foldr = 'picture'
 log_foldr = 'log_ind'
 
-local_data_path = 'e:/D1/diffusion/HydroSynth/datas/U_net1_3D_data/'
+local_data_path = 'e:/D1/diffusion/HydroSynth/datas/U_net3_3D_data/'
 colab_data_path = '/content/drive/MyDrive/my_models/my_model_data/'
+if os.path.exists(local_data_path):
+    os.makedirs(local_data_path, exist_ok=True)
+
 
 if os.name == 'nt':
     lr_path = local_data_path + lr_foldr
