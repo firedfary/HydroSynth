@@ -11,7 +11,7 @@ import tqdm
 import numpy as np
 from HydroSynth.utils import utils
 import config
-# config.auto_save_config()
+config.enable_auto_create_folders()
 from torch.utils.tensorboard import SummaryWriter
 from unetlite import UNetLite
 
@@ -37,14 +37,14 @@ def train():
     device = torch.device(config.modelconfig["device"])
     target_file_dir = config.modelconfig["hr_path"]
 
-    target_data = target_file_dir+'/hr_dataf1_small1.npy'
+    target_data = target_file_dir+'/hr_data_9402.npy'
     target_data = np.load(target_data).astype(np.float32)#[:212]
     target_data = np.expand_dims(target_data, 1)
     target_data = torch.from_numpy(target_data)  # 使用from_numpy而不是tensor()
     data_mask = torch.isnan(target_data)
 
     model_file_dir = config.modelconfig["lr_path"]
-    model_data = np.load(model_file_dir+'/lr_data_lead0_small.npy').astype(np.float32)#[:212]
+    model_data = np.load(model_file_dir+'/lr_data_lead1_9401.npy').astype(np.float32)#[:212]
     condition = torch.from_numpy(model_data)  # 使用from_numpy而不是tensor()
     # condition = condition.view(-1, 10, 120, 140)#51786,10,32,32
 
