@@ -13,6 +13,7 @@ if _proj_root not in sys.path:
 
 from HydroSynth.utils import utils
 from HydroSynth import config
+config.enable_auto_create_folders()
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
@@ -100,9 +101,13 @@ def prepare_data():
     return train_set, test_set
 
 device = config.modelconfig['device']
-model = model1.SpatioTemporalCorrector(in_ch=10, cond_time=6, sst_m=6, base_channels=32).to(device)
+model = model1.SpatioTemporalCorrector(in_ch=10, cond_time=6, sst_m=6, base_channels=8).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
+if config.modelconfig["train_load_weight"] is not None:
+    model.load_state_dict(torch.load(
+        os.path.join(config.modelconfig["save_weight_dir"], config.modelconfig["train_load_weight"]),
+        map_location=device))
 
 train_set, test_set = prepare_data()
 
@@ -180,5 +185,7 @@ for e in range(config.modelconfig["epoch"]):
             avg_acc_i = np.mean(test_acc[i])
             writer.add_scalar(f"Acc/test_t{i}", avg_acc_i, e)
         writer.add_scalar("test_loss", np.mean(test_loss), e)
+    if e % 5 == 0:
+        torch.save(model, os.path.join(config.modelconfig["save_weight_path"], f"epoch_{e}.pt"))
 
 writer.close()
