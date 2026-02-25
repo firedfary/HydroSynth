@@ -333,6 +333,7 @@ class SpatioTemporalCorrector(nn.Module):
                  in_ch=10,
                  cond_time=6,
                  sst_m=6,
+                 pc_dim: Optional[int] = None,
                  base_channels=32,
                  film_channels=[32,64,128,128],
                  use_convlstm=True,
@@ -368,9 +369,11 @@ class SpatioTemporalCorrector(nn.Module):
             self.convlstm = ConvLSTM(in_ch=chs[3], hidden_ch=chs[3])
 
         # IndexEncoder (SST PCs + lead embedding) -> per-channel gammas/betas
-        # assume user provides compact PCs of size pc_dim (default use sst_m * 4)
-        pc_dim = sst_m * 4
-        self.index_encoder = IndexEncoder(in_dim=pc_dim, hidden=256, film_channels_per_block=film_channels, lead_embed_dim=16)
+        # If pc_dim is not given, fallback to simple SST stats size: sst_m * 4
+        if pc_dim is None:
+            pc_dim = sst_m * 4
+        self.pc_dim = pc_dim
+        self.index_encoder = IndexEncoder(in_dim=self.pc_dim, hidden=256, film_channels_per_block=film_channels, lead_embed_dim=16)
 
         # Decoder (UNet-style) with FiLM injection per block
         self.up3 = UpBlock(chs[3]*2, chs[2])
@@ -469,6 +472,15 @@ class SpatioTemporalCorrector(nn.Module):
 
         # IndexEncoder -> per-block gamma/beta
         # sst_pcs: [B,T,pc_dim] ; lead_idx: tensor 0..T-1
+        if sst_pcs.dim() != 3:
+            raise ValueError(f"sst_pcs must be 3D [B,T,pc_dim], got shape {tuple(sst_pcs.shape)}")
+        if sst_pcs.shape[1] != T:
+            raise ValueError(f"sst_pcs time dimension mismatch: expected T={T}, got {sst_pcs.shape[1]}")
+        if sst_pcs.shape[2] != self.pc_dim:
+            raise ValueError(
+                f"sst_pcs feature dim mismatch: model expects pc_dim={self.pc_dim}, got {sst_pcs.shape[2]}. "
+                f"Build model with pc_dim={sst_pcs.shape[2]} or pass matching pcs."
+            )
         lead_idx = torch.arange(self.T, device=cond.device)
         gammas, betas = self.index_encoder(sst_pcs, lead_idx)
 

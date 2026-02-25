@@ -73,11 +73,11 @@ def prepare_data():
 
     # --- PCs from SST ---
     sst = np.load(config.modelconfig["sst_file"])#[B,M,H,W]
-    # n_pcs = config.modelconfig["n_pcs"]
-    # window = config.modelconfig["pc_window"]
-    # step = config.modelconfig["pc_step"]#366,5/5,89,180
-    # pcs, eof_patterns = compute_pcs_from_sst(sst, n_pcs=n_pcs, window=window, step=step)  # [T', n_pcs*window]366,10
-    # pcs_t = torch.from_numpy(pcs).permute(1, 0, 2)#366,6,5
+    n_pcs = config.modelconfig["n_pcs"]
+    window = config.modelconfig["pc_window"]
+    step = config.modelconfig["pc_step"]#366,5/5,89,180
+    pcs, eof_patterns = compute_pcs_from_sst(sst, n_pcs=n_pcs, window=window, step=step)  # [T', n_pcs*window]366,10
+    pcs_t = torch.from_numpy(pcs).permute(1, 0, 2)#366,6,5
 
     # --- 对齐时间长度 ---
     sst_t = torch.from_numpy(sst)
@@ -86,6 +86,7 @@ def prepare_data():
     mask_t = mask_t[:minT]#361,1,6,120,140
     cond_t = cond_t[:minT]#361,10,6,120,140
     sst_t = sst_t[:minT]#361,6,89,180
+    pcs_t = pcs_t[:minT]#361,6,5
 
     # --- split train/test ---
     num_test_samples = 21
@@ -93,23 +94,30 @@ def prepare_data():
     train_end = total - num_test_samples
 
     train_set = TensorDataset(
-        target_t[:train_end], cond_t[:train_end], mask_t[:train_end], sst_t[:train_end]
+        target_t[:train_end], cond_t[:train_end], mask_t[:train_end], sst_t[:train_end], pcs_t[:train_end]
     )
     test_set = TensorDataset(
-        target_t[train_end:], cond_t[train_end:], mask_t[train_end:], sst_t[train_end:]
+        target_t[train_end:], cond_t[train_end:], mask_t[train_end:], sst_t[train_end:], pcs_t[train_end:]
     )
     return train_set, test_set
 
 device = config.modelconfig['device']
-model = model1.SpatioTemporalCorrector(in_ch=10, cond_time=6, sst_m=6, base_channels=8).to(device)
+train_set, test_set = prepare_data()
+pc_dim = train_set.tensors[4].shape[-1]
+
+model = model1.SpatioTemporalCorrector(
+    in_ch=10,
+    cond_time=6,
+    sst_m=6,
+    pc_dim=pc_dim,
+    base_channels=32,
+).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 if config.modelconfig["train_load_weight"] is not None:
     model.load_state_dict(torch.load(
         os.path.join(config.modelconfig["save_weight_dir"], config.modelconfig["train_load_weight"]),
         map_location=device))
-
-train_set, test_set = prepare_data()
 
 train_loader = DataLoader(
     train_set, batch_size=config.modelconfig["batch_size"],
@@ -124,10 +132,10 @@ writer = SummaryWriter(log_dir=config.modelconfig["log_path"])
 for e in range(config.modelconfig["epoch"]):
     model.train()
     train_loss, train_acc = [], {i: [] for i in range(6)}
-    for target, cond, mask, sst in tqdm.tqdm(train_loader, desc=f"Epoch {e}"):
-        target, cond, mask, sst = target.to(device), cond.to(device), mask.to(device), sst.to(device)
+    for target, cond, mask, sst, pcs in tqdm.tqdm(train_loader, desc=f"Epoch {e}"):
+        target, cond, mask, sst, pcs = target.to(device), cond.to(device), mask.to(device), sst.to(device), pcs.to(device)
 
-        pred = model(cond, sst)
+        pred = model(cond, sst, pcs)
         nll = model1.zero_inflated_gamma_nll(pred, target)
         crps = model1.approx_crps_by_sampling(pred, target, n_samples=16)
         mse = F.mse_loss(pred['delta'][~mask], target[~mask])
@@ -158,10 +166,10 @@ for e in range(config.modelconfig["epoch"]):
     model.eval()
     test_loss, test_acc = [], {i: [] for i in range(6)}
     with torch.no_grad():
-        for target, cond, mask, sst in test_loader:
-            target, cond, mask, sst = target.to(device), cond.to(device), mask.to(device), sst.to(device)
+        for target, cond, mask, sst, pcs in test_loader:
+            target, cond, mask, sst, pcs = target.to(device), cond.to(device), mask.to(device), sst.to(device), pcs.to(device)
 
-            pred = model(cond, sst)
+            pred = model(cond, sst, pcs)
             nll = model1.zero_inflated_gamma_nll(pred, target)
             crps = model1.approx_crps_by_sampling(pred, target, n_samples=16)
             mse = F.mse_loss(pred['delta'][~mask], target[~mask])
