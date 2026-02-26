@@ -12,6 +12,7 @@ if _proj_root not in sys.path:
 
 from HydroSynth.utils import utils
 from HydroSynth import config
+config.enable_auto_create_folders()
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.decomposition import PCA

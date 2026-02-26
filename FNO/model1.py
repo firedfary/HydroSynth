@@ -205,16 +205,39 @@ class SimpleFNO2D(nn.Module):
 class TemporalTransformer(nn.Module):
     def __init__(self, token_dim, n_layers=2, n_heads=4, mlp_dim=512, dropout=0.1):
         super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(d_model=token_dim, nhead=n_heads, dim_feedforward=mlp_dim, dropout=dropout, activation='gelu')
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=token_dim,
+            nhead=n_heads,
+            dim_feedforward=mlp_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.pos_emb = None  # we'll build relative positional enc if needed
 
     def forward(self, tokens):  # tokens: [B, T, D]
-        # transformer expects [T, B, D]
-        x = tokens.permute(1, 0, 2)
-        x_out = self.transformer(x)
-        x_out = x_out.permute(1, 0, 2)
-        return x_out  # [B, T, D]
+        return self.transformer(tokens)  # [B, T, D]
+
+
+class TemporalConvFusion(nn.Module):
+    """Lightweight temporal interaction over lead axis using depthwise separable Conv1D."""
+    def __init__(self, token_dim, kernel_size=3, dropout=0.1):
+        super().__init__()
+        padding = kernel_size // 2
+        self.dw = nn.Conv1d(token_dim, token_dim, kernel_size, padding=padding, groups=token_dim)
+        self.pw = nn.Conv1d(token_dim, token_dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(token_dim)
+
+    def forward(self, tokens):  # [B,T,D]
+        x = tokens.transpose(1, 2)  # [B,D,T]
+        x = self.dw(x)
+        x = self.act(x)
+        x = self.pw(x)
+        x = self.drop(x)
+        x = x.transpose(1, 2)  # [B,T,D]
+        return self.norm(tokens + x)
 
 # --------------------
 # IndexEncoder: map SST PCs + lead embedding to per-block per-channel FiLM vectors (gamma/beta)
@@ -335,8 +358,12 @@ class SpatioTemporalCorrector(nn.Module):
                  sst_m=6,
                  pc_dim: Optional[int] = None,
                  base_channels=32,
-                 film_channels=[32,64,128,128],
+                 film_channels=None,
                  use_convlstm=True,
+                 use_fno=True,
+                 temporal_mode='transformer',
+                 use_lead_adapter=True,
+                 index_hidden=256,
                  fno_modes=(12,12),
                  transformer_dim=256,
                  transformer_layers=2,
@@ -345,6 +372,10 @@ class SpatioTemporalCorrector(nn.Module):
         self.T = cond_time
         self.in_ch = in_ch
         self.base_channels = base_channels
+        if film_channels is None:
+            film_channels = [base_channels, base_channels * 2, base_channels * 4, base_channels * 4]
+        if len(film_channels) != 4:
+            raise ValueError(f"film_channels must have length 4, got {film_channels}")
         # Shared UNet encoder (weights shared across T)
         chs = film_channels
         self.enc0 = DownBlock(in_ch, chs[0])
@@ -355,13 +386,22 @@ class SpatioTemporalCorrector(nn.Module):
         # Bottleneck conv
         self.bottleneck_conv = nn.Conv2d(chs[3], chs[3], 3, padding=1)
 
-        # FNO block
-        self.fno = SimpleFNO2D(chs[3], modes_height=fno_modes[0], modes_width=fno_modes[1])
+        # FNO block (optional due to high compute cost)
+        self.use_fno = use_fno
+        self.fno = SimpleFNO2D(chs[3], modes_height=fno_modes[0], modes_width=fno_modes[1]) if use_fno else nn.Identity()
 
         # Temporal modules: pool spatial to token dim and transformer
         self.pool = nn.AdaptiveAvgPool2d(1)
         token_dim = chs[3]
-        self.temporal_transformer = TemporalTransformer(token_dim, n_layers=transformer_layers, n_heads=4, mlp_dim=token_dim*2)
+        self.temporal_mode = temporal_mode
+        if temporal_mode == 'transformer':
+            self.temporal_transformer = TemporalTransformer(token_dim, n_layers=transformer_layers, n_heads=4, mlp_dim=token_dim*2)
+        elif temporal_mode == 'conv':
+            self.temporal_transformer = TemporalConvFusion(token_dim, kernel_size=3, dropout=0.1)
+        elif temporal_mode == 'none':
+            self.temporal_transformer = nn.Identity()
+        else:
+            raise ValueError(f"Unknown temporal_mode: {temporal_mode}")
 
         # optional ConvLSTM to recover temporal-spatial features
         self.use_convlstm = use_convlstm
@@ -373,7 +413,12 @@ class SpatioTemporalCorrector(nn.Module):
         if pc_dim is None:
             pc_dim = sst_m * 4
         self.pc_dim = pc_dim
-        self.index_encoder = IndexEncoder(in_dim=self.pc_dim, hidden=256, film_channels_per_block=film_channels, lead_embed_dim=16)
+        self.index_encoder = IndexEncoder(
+            in_dim=self.pc_dim,
+            hidden=index_hidden,
+            film_channels_per_block=film_channels,
+            lead_embed_dim=16,
+        )
 
         # Decoder (UNet-style) with FiLM injection per block
         self.up3 = UpBlock(chs[3]*2, chs[2])
@@ -383,10 +428,10 @@ class SpatioTemporalCorrector(nn.Module):
         self.final_conv = nn.Conv2d(chs[0], chs[0], 3, padding=1)
 
         # Lead adapter and probabilistic head (apply per time slice)
-        self.lead_adapter = LeadAdapterMoE(in_ch=chs[0], out_ch=chs[0], n_experts=n_experts)
+        self.lead_adapter = LeadAdapterMoE(in_ch=chs[0], out_ch=chs[0], n_experts=n_experts) if use_lead_adapter else nn.Identity()
         self.prob_head = ProbabilisticHead(in_ch=chs[0])
 
-    def forward(self, cond, sst, sst_pcs=None):
+    def forward(self, cond, sst=None, sst_pcs=None):
         """
         cond: [B, C, T, H, W]
         sst: [B, M, H, W] or [B, T, M, H, W]
@@ -401,6 +446,8 @@ class SpatioTemporalCorrector(nn.Module):
 
         # Prepare sst_pcs if not given: simple global pooling + linear projection to pc_dim
         if sst_pcs is None:
+            if sst is None:
+                raise ValueError("Either sst_pcs or sst must be provided.")
             if sst.dim() == 4:  # [B, M, H, W] -> broadcast
                 # compute simple stats per month: global mean + std + min + max => M*4 dims
                 sst_stats = []
@@ -445,8 +492,13 @@ class SpatioTemporalCorrector(nn.Module):
             s2, x = self.enc2(x)
             s3, x = self.enc3(x)
             bott = self.bottleneck_conv(x)
-            # optional FNO
-            bott = self.fno(bott)
+            # Keep FFT path in FP32 under autocast to avoid half-precision cuFFT issues.
+            if self.use_fno and bott.is_cuda and torch.is_autocast_enabled():
+                with torch.cuda.amp.autocast(enabled=False):
+                    bott = self.fno(bott.float())
+                bott = bott.to(x.dtype)
+            else:
+                bott = self.fno(bott)
             enc_feats.append(bott)
             skips0.append(s0); skips1.append(s1); skips2.append(s2); bottlenecks.append(s3)
 
@@ -583,40 +635,27 @@ def approx_crps_by_sampling(pred, target, n_samples=64, eps=1e-6):
     y = y.clamp(min=0.0)
 
     # --------
-    # Monte Carlo samples
+    # Monte-Carlo CRPS approximation with O(S) pairing
+    # CRPS(F,y)=E|X-y|-0.5E|X-X'|, where X and X' are i.i.d.
     # --------
-    samples = []
-    for _ in range(n_samples):
-        u = torch.rand_like(p0)
-        zero_mask = (u < p0)
+    gamma_dist = torch.distributions.Gamma(alpha, 1.0 / beta)
+    s1 = gamma_dist.sample((n_samples,))  # [S,B,1,T,H,W]
+    s2 = gamma_dist.sample((n_samples,))  # [S,B,1,T,H,W]
 
-        gamma_dist = torch.distributions.Gamma(alpha, 1.0 / beta)
-        samp_gamma = gamma_dist.sample()
+    z1 = torch.rand_like(s1) < p0.unsqueeze(0)
+    z2 = torch.rand_like(s2) < p0.unsqueeze(0)
+    s1 = torch.where(z1, torch.zeros_like(s1), s1)
+    s2 = torch.where(z2, torch.zeros_like(s2), s2)
 
-        samp = torch.where(zero_mask, torch.zeros_like(samp_gamma), samp_gamma)
-        samples.append(samp)
+    valid = valid_mask.unsqueeze(0)  # [1,B,1,T,H,W]
+    n_valid = valid_mask.sum().clamp_min(1)
 
-    Ssamples = torch.stack(samples, dim=0)  # [S,B,1,T,H,W]
+    ey = torch.where(valid, torch.abs(s1 - y.unsqueeze(0)), torch.zeros_like(s1)).sum()
+    epair = torch.where(valid, torch.abs(s1 - s2), torch.zeros_like(s1)).sum()
 
-    # --------
-    # CRPS terms
-    # --------
-    # E|X - y|
-    Ey = torch.abs(Ssamples - y.unsqueeze(0))
-    Ey = torch.where(valid_mask.unsqueeze(0), Ey, torch.zeros_like(Ey))
-    Ey = Ey.sum(dim=0) / valid_mask.sum()
-
-    # E|X - X'|
-    diffs = torch.abs(Ssamples.unsqueeze(0) - Ssamples.unsqueeze(1))
-    diffs = torch.where(
-        valid_mask.unsqueeze(0).unsqueeze(0),
-        diffs,
-        torch.zeros_like(diffs)
-    )
-    Epair = 0.5 * diffs.sum(dim=(0,1)) / valid_mask.sum()
-
-    crps = Ey - Epair
-    return crps.mean()
+    ey = ey / (n_samples * n_valid)
+    epair = 0.5 * epair / (n_samples * n_valid)
+    return ey - epair
 
 # --------------------
 # Example training step (sketch)
