@@ -1,146 +1,491 @@
 import os
+import random
 import sys
+from typing import Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
-import torch.nn.functional as F
-import tqdm
+from scipy.interpolate import griddata
 from sklearn.decomposition import PCA
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+import tqdm
 
-import model1
-
-# Ensure project root is on sys.path so absolute imports like 'HydroSynth' work
+# Ensure project root is on sys.path so absolute imports like 'HydroSynth' work.
 _proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _proj_root = os.path.normpath(_proj_root)
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
 from HydroSynth import config
-from HydroSynth.utils import utils
+try:
+    from HydroSynth.FNO import model1
+except Exception:
+    import model1  # fallback for direct script execution from HydroSynth/FNO
 
 config.enable_auto_create_folders()
 
 
-def compute_pcs_from_sst(sst, n_pcs=3, window=1, step=1):
-    """
-    Compute EOF PCs from SST.
-    Expected input shape: [B, T, H, W], output PCs: [T, B, n_pcs].
-    """
-    print("Loaded SST shape:", sst.shape)
-    B, T, H, W = sst.shape
-    pcss = []
-    eofs = []
-    variance = []
-    for t in range(T):
-        x = sst[:, t].reshape(B, -1)
-        x[~np.isfinite(x)] = 0.0
-        pca = PCA(n_components=n_pcs)
-        pcs = pca.fit_transform(x)  # [B, n_pcs]
-        pcs = (pcs - pcs.mean(0, keepdims=True)) / (pcs.std(0, keepdims=True) + 1e-8)
-        eof_patterns = pca.components_.reshape(n_pcs, H, W)
-        pcss.append(pcs)
-        eofs.append(eof_patterns)
-        variance.append(pca.explained_variance_ratio_.sum())
-
-    print(f"PCA done. Explained variance={np.mean(variance):.3f}")
-    pcs = np.stack(pcss, axis=0)  # [T, B, n_pcs]
-    eof_patterns = np.stack(eofs, axis=0)  # [T, n_pcs, H, W]
-    return pcs.astype(np.float32), eof_patterns.astype(np.float32)
+LEADS = 6
+COND_VARS = ["h500", "slp", "t2m", "t850", "u850", "v850", "sst"]
+OBS_GRID_LONS = np.arange(70.0, 140.0, 0.5, dtype=np.float32)  # 140
+OBS_GRID_LATS = np.arange(60.0, 0.0, -0.5, dtype=np.float32)   # 120
+OBS_GRID_LON2D, OBS_GRID_LAT2D = np.meshgrid(OBS_GRID_LONS, OBS_GRID_LATS)
 
 
-def prepare_data():
-    """Load target, condition and EOF PCs. Return TensorDatasets."""
-    target_file = os.path.join(config.modelconfig["hr_path"], "hr_data1.npy")
-    target = np.load(target_file).astype(np.float32)  # [B,T,H,W]
-    target = np.expand_dims(target, 1)  # [B,1,T,H,W]
-    target_t = torch.from_numpy(target)
-    mask_t = torch.isnan(target_t)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    cond_file = os.path.join(config.modelconfig["lr_path"], "lr_data1.npy")
-    cond = np.load(cond_file).astype(np.float32)  # [B,C,T,H,W]
-    cond_t = torch.from_numpy(cond)
 
-    sst = np.load(config.modelconfig["sst_file"])  # [B,T,H,W]
-    n_pcs = int(config.modelconfig["n_pcs"])
-    window = int(config.modelconfig["pc_window"])
-    step = int(config.modelconfig["pc_step"])
-    pcs, _ = compute_pcs_from_sst(sst, n_pcs=n_pcs, window=window, step=step)
-    pcs_t = torch.from_numpy(pcs).permute(1, 0, 2)  # [B,T,n_pcs]
+def build_init_dates() -> pd.DatetimeIndex:
+    dates = pd.date_range(start="1994-01-01", end="2024-09-01", freq="MS")
+    drop = {pd.Timestamp("2011-09-01"), pd.Timestamp("2011-10-01")}
+    dates = pd.DatetimeIndex([d for d in dates if d not in drop])
+    return dates
 
-    min_t = min(target_t.shape[0], cond_t.shape[0], pcs_t.shape[0])
-    target_t = target_t[:min_t]
-    mask_t = mask_t[:min_t]
-    cond_t = cond_t[:min_t]
-    pcs_t = pcs_t[:min_t]
 
-    num_test_samples = 21
-    total = len(target_t)
-    train_end = total - num_test_samples
+def split_indices_by_date(init_dates: pd.DatetimeIndex) -> Dict[str, np.ndarray]:
+    train_end = pd.Timestamp("2015-12-01")
+    val_start = pd.Timestamp("2016-01-01")
+    val_end = pd.Timestamp("2019-12-01")
+    test_start = pd.Timestamp("2020-01-01")
 
-    train_set = TensorDataset(
-        target_t[:train_end], cond_t[:train_end], mask_t[:train_end], pcs_t[:train_end]
+    train_idx = np.where(init_dates <= train_end)[0]
+    val_idx = np.where((init_dates >= val_start) & (init_dates <= val_end))[0]
+    test_idx = np.where(init_dates >= test_start)[0]
+
+    return {"train": train_idx, "val": val_idx, "test": test_idx}
+
+
+def _normalize_station_coords(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if df["Long"].abs().max() > 180:
+        df["Long"] = df["Long"] / 100.0
+    if df["Lat"].abs().max() > 90:
+        df["Lat"] = df["Lat"] / 100.0
+    return df
+
+
+def _month_start(ts: pd.Timestamp) -> pd.Timestamp:
+    return pd.Timestamp(year=ts.year, month=ts.month, day=1)
+
+
+def prepare_observe_data(
+    csv_path: str,
+    cache_path: str,
+    start_date: str = "1994-01-01",
+    end_date: str = "2024-12-01",
+) -> Tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    if os.path.exists(cache_path):
+        cached = np.load(cache_path, allow_pickle=False)
+        obs_grid = cached["obs_grid"].astype(np.float32)
+        obs_mask = cached["obs_mask"].astype(np.float32)
+        obs_dates = pd.to_datetime(cached["obs_dates"].astype(str))
+        return obs_grid, obs_mask, pd.DatetimeIndex(obs_dates)
+
+    df = pd.read_csv(csv_path)
+    if "time" not in df.columns:
+        raise ValueError(f"Column 'time' not found in {csv_path}")
+    if "anoma" not in df.columns:
+        raise ValueError(f"Column 'anoma' not found in {csv_path}")
+    if "Long" not in df.columns or "Lat" not in df.columns:
+        raise ValueError(f"Columns 'Long' and 'Lat' are required in {csv_path}")
+
+    df["time"] = pd.to_datetime(df["time"])
+    df["time"] = df["time"].apply(_month_start)
+    df = _normalize_station_coords(df)
+
+    all_months = pd.date_range(start=start_date, end=end_date, freq="MS")
+    grid_all = []
+    mask_all = []
+    for cur_month in tqdm.tqdm(all_months, desc="Interpolate observations"):
+        cur = df[df["time"] == cur_month]
+        if len(cur) < 3:
+            grid_all.append(np.zeros((120, 140), dtype=np.float32))
+            mask_all.append(np.zeros((120, 140), dtype=np.float32))
+            continue
+
+        points = cur[["Long", "Lat"]].to_numpy(dtype=np.float32)
+        values = cur["anoma"].to_numpy(dtype=np.float32)
+
+        try:
+            linear = griddata(points, values, (OBS_GRID_LON2D, OBS_GRID_LAT2D), method="linear")
+        except Exception:
+            linear = np.full((120, 140), np.nan, dtype=np.float32)
+
+        try:
+            nearest = griddata(points, values, (OBS_GRID_LON2D, OBS_GRID_LAT2D), method="nearest")
+        except Exception:
+            nearest = np.zeros((120, 140), dtype=np.float32)
+
+        valid = np.isfinite(linear)
+        merged = np.where(valid, linear, nearest)
+        merged = np.nan_to_num(merged, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        mask = valid.astype(np.float32)
+
+        grid_all.append(merged)
+        mask_all.append(mask)
+
+    obs_grid = np.stack(grid_all, axis=0).astype(np.float32)
+    obs_mask = np.stack(mask_all, axis=0).astype(np.float32)
+    obs_dates = pd.DatetimeIndex(all_months)
+
+    np.savez_compressed(
+        cache_path,
+        obs_grid=obs_grid,
+        obs_mask=obs_mask,
+        obs_dates=np.array([d.strftime("%Y-%m-%d") for d in obs_dates]),
     )
-    test_set = TensorDataset(
-        target_t[train_end:], cond_t[train_end:], mask_t[train_end:], pcs_t[train_end:]
+    return obs_grid, obs_mask, obs_dates
+
+
+def build_obs_targets(
+    init_dates: pd.DatetimeIndex,
+    obs_grid: np.ndarray,
+    obs_mask: np.ndarray,
+    obs_dates: pd.DatetimeIndex,
+    leads: int = LEADS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(init_dates)
+    target = np.zeros((n, leads, 120, 140), dtype=np.float32)
+    mask = np.zeros((n, leads, 120, 140), dtype=np.float32)
+
+    obs_index = {_month_start(d): i for i, d in enumerate(obs_dates)}
+    for i, init_d in enumerate(init_dates):
+        for l in range(leads):
+            tgt_d = _month_start(init_d + pd.DateOffset(months=l))
+            j = obs_index.get(tgt_d, None)
+            if j is None:
+                continue
+            target[i, l] = obs_grid[j]
+            mask[i, l] = obs_mask[j]
+    return target, mask
+
+
+def compute_cond_stats(cond_raw: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    n_var = cond_raw.shape[1]
+    leads = cond_raw.shape[2]
+    sum_x = np.zeros((n_var, leads), dtype=np.float64)
+    sum_x2 = np.zeros((n_var, leads), dtype=np.float64)
+    count = np.zeros((n_var, leads), dtype=np.float64)
+
+    for idx in tqdm.tqdm(train_idx, desc="Cond stats"):
+        x = cond_raw[int(idx)].astype(np.float32)  # [7,6,180,360]
+        valid = np.isfinite(x) & (x > -9000.0)
+        xv = np.where(valid, x, 0.0)
+        sum_x += xv.sum(axis=(2, 3))
+        sum_x2 += (xv * xv).sum(axis=(2, 3))
+        count += valid.sum(axis=(2, 3))
+
+    count = np.maximum(count, 1.0)
+    mean = sum_x / count
+    var = sum_x2 / count - mean * mean
+    var = np.maximum(var, 1e-8)
+    std = np.sqrt(var)
+    std = np.maximum(std, 1e-4)
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def build_or_load_cond_global(
+    cond_raw: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    n_samples: int,
+    cache_path: str,
+) -> np.ndarray:
+    expected_shape = (n_samples, LEADS, len(COND_VARS) + 1, 180, 360)
+    if os.path.exists(cache_path):
+        cached = np.load(cache_path, mmap_mode="r")
+        if tuple(cached.shape) == expected_shape:
+            return cached
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    out = np.lib.format.open_memmap(
+        cache_path,
+        mode="w+",
+        dtype=np.float16,
+        shape=expected_shape,
     )
-    return train_set, test_set
+
+    for i in tqdm.tqdm(range(n_samples), desc="Build cond_global cache"):
+        x = cond_raw[i].astype(np.float32)  # [7,6,180,360]
+        invalid = (~np.isfinite(x)) | (x <= -9000.0)
+        sst_valid = (~invalid[6]).astype(np.float32)  # [6,180,360]
+
+        x[invalid] = np.nan
+        x = (x - mean[:, :, None, None]) / std[:, :, None, None]
+        x = np.clip(x, -6.0, 6.0)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+        x = np.concatenate([x, sst_valid[None, ...]], axis=0)  # [8,6,180,360]
+        x = np.transpose(x, (1, 0, 2, 3))  # [6,8,180,360]
+        out[i] = x.astype(np.float16)
+
+    out.flush()
+    del out
+    return np.load(cache_path, mmap_mode="r")
 
 
-def build_model(train_set, device):
-    cond_tensor = train_set.tensors[1]
-    pcs_tensor = train_set.tensors[3]
-    in_ch = int(cond_tensor.shape[1])
-    cond_time = int(cond_tensor.shape[2])
-    pc_dim = int(pcs_tensor.shape[-1])
+def compute_sst_pcs(
+    sst_raw: np.ndarray,
+    train_idx: np.ndarray,
+    n_pcs: int,
+    cache_path: str,
+) -> np.ndarray:
+    if os.path.exists(cache_path):
+        cached = np.load(cache_path)
+        if cached.shape[:2] == sst_raw.shape[:2] and cached.shape[2] == n_pcs:
+            return cached.astype(np.float32)
 
-    film_channels = config.modelconfig.get("film_channels")
-    if film_channels is not None:
-        film_channels = [int(v) for v in film_channels]
+    n, t, h, w = sst_raw.shape
+    pcs = np.zeros((n, t, n_pcs), dtype=np.float32)
 
-    fno_modes = config.modelconfig.get("fno_modes", (12, 12))
-    if isinstance(fno_modes, list):
-        fno_modes = tuple(fno_modes)
+    min_valid_train = max(2, int(0.1 * len(train_idx)))
+    for lead in tqdm.tqdm(range(t), desc="SST EOF PCs"):
+        x = sst_raw[:, lead].reshape(n, h * w).astype(np.float32)
+        invalid = (~np.isfinite(x)) | (x <= -9000.0)
+        x[invalid] = np.nan
 
-    model = model1.SpatioTemporalCorrector(
-        in_ch=in_ch,
-        cond_time=cond_time,
-        sst_m=cond_time,
-        pc_dim=pc_dim,
-        base_channels=int(config.modelconfig.get("base_channels", 24)),
-        film_channels=film_channels,
-        use_fno=bool(config.modelconfig.get("use_fno", False)),
-        temporal_mode=config.modelconfig.get("temporal_mode", "conv"),
-        use_convlstm=bool(config.modelconfig.get("use_convlstm", False)),
-        use_lead_adapter=bool(config.modelconfig.get("use_lead_adapter", False)),
-        index_hidden=int(config.modelconfig.get("index_hidden", 128)),
-        fno_modes=fno_modes,
-        transformer_layers=int(config.modelconfig.get("transformer_layers", 1)),
-        n_experts=int(config.modelconfig.get("n_experts", 2)),
+        x_train = x[train_idx]
+        valid_cols = np.isfinite(x_train).sum(axis=0) >= min_valid_train
+        if valid_cols.sum() < 2:
+            continue
+
+        x = x[:, valid_cols]
+        x_train = x[train_idx]
+
+        col_mean = np.nanmean(x_train, axis=0)
+        col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0)
+
+        nan_pos = ~np.isfinite(x)
+        if nan_pos.any():
+            x[nan_pos] = col_mean[np.where(nan_pos)[1]]
+
+        max_comp = min(n_pcs, len(train_idx), x.shape[1])
+        if max_comp < 1:
+            continue
+
+        pca = PCA(n_components=max_comp, svd_solver="randomized", random_state=42)
+        pca.fit(x[train_idx])
+        z = pca.transform(x)
+
+        mu = z[train_idx].mean(axis=0, keepdims=True)
+        sd = z[train_idx].std(axis=0, keepdims=True)
+        sd = np.where(sd < 1e-6, 1.0, sd)
+        z = (z - mu) / sd
+
+        pcs[:, lead, :max_comp] = z.astype(np.float32)
+
+    np.save(cache_path, pcs.astype(np.float32))
+    return pcs
+
+
+def prepare_data() -> Dict[str, np.ndarray]:
+    lr_path = config.modelconfig["lr_path"]
+    cond_path = os.path.join(lr_path, "cond.npy")
+    anomaly_path = os.path.join(lr_path, "anomaly.npy")
+    sst_path = config.modelconfig["sst_file"]
+
+    cond_raw = np.load(cond_path, mmap_mode="r")
+    ec_anomaly = np.load(anomaly_path, mmap_mode="r")
+    sst_raw = np.load(sst_path, mmap_mode="r")
+
+    if cond_raw.ndim != 5 or cond_raw.shape[1:3] != (7, 6):
+        raise ValueError(f"cond.npy shape must be [N,7,6,180,360], got {cond_raw.shape}")
+    if ec_anomaly.ndim != 4 or ec_anomaly.shape[1] != 6:
+        raise ValueError(f"anomaly.npy shape must be [N,6,120,140], got {ec_anomaly.shape}")
+    if sst_raw.ndim != 4 or sst_raw.shape[1] != 6:
+        raise ValueError(f"sst_file shape must be [N,6,H,W], got {sst_raw.shape}")
+
+    init_dates_full = build_init_dates()
+    n = min(cond_raw.shape[0], ec_anomaly.shape[0], sst_raw.shape[0], len(init_dates_full), 366)
+    if n < 300:
+        raise ValueError(f"Aligned sample count too small: {n}")
+
+    init_dates = pd.DatetimeIndex(init_dates_full[:n])
+    cond_raw = cond_raw[:n]
+    ec_anomaly = ec_anomaly[:n].astype(np.float32)
+    sst_raw = sst_raw[:n].astype(np.float32)
+
+    splits = split_indices_by_date(init_dates)
+
+    obs_csv_path = config.modelconfig.get(
+        "observe_csv_path",
+        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "utils", "observe_data24.csv")),
+    )
+    obs_cache_path = os.path.join(lr_path, "observe_grid_cache_199401_202412.npz")
+    obs_grid, obs_month_mask, obs_dates = prepare_observe_data(
+        csv_path=obs_csv_path,
+        cache_path=obs_cache_path,
+        start_date="1994-01-01",
+        end_date="2024-12-01",
+    )
+
+    obs_target, obs_mask = build_obs_targets(
+        init_dates=init_dates,
+        obs_grid=obs_grid,
+        obs_mask=obs_month_mask,
+        obs_dates=obs_dates,
+        leads=LEADS,
+    )
+
+    ec_base = (ec_anomaly / 100.0)[:, :, None, :, :]      # [N,6,1,120,140]
+    obs_target = (obs_target / 100.0)[:, :, None, :, :]   # [N,6,1,120,140]
+    obs_mask = obs_mask[:, :, None, :, :].astype(np.float32)
+
+    cond_mean, cond_std = compute_cond_stats(cond_raw=cond_raw, train_idx=splits["train"])
+    cond_cache_path = os.path.join(lr_path, f"cond_global_norm_clip6_fp16_n{n}.npy")
+    cond_global = build_or_load_cond_global(
+        cond_raw=cond_raw,
+        mean=cond_mean,
+        std=cond_std,
+        n_samples=n,
+        cache_path=cond_cache_path,
+    )  # [N,6,8,180,360], float16 memmap
+
+    n_pcs = int(config.modelconfig.get("n_pcs", 8))
+    pcs_cache_path = os.path.join(lr_path, f"sst_pcs_eof_k{n_pcs}_n{n}.npy")
+    sst_pcs = compute_sst_pcs(
+        sst_raw=sst_raw,
+        train_idx=splits["train"],
+        n_pcs=n_pcs,
+        cache_path=pcs_cache_path,
+    )  # [N,6,K]
+
+    data = {
+        "cond_global": cond_global,
+        "ec_base": ec_base.astype(np.float32),
+        "obs_target": obs_target.astype(np.float32),
+        "obs_mask": obs_mask.astype(np.float32),
+        "sst_pcs": sst_pcs.astype(np.float32),
+        "init_dates": np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
+        "split_indices": splits,
+        "cond_mean": cond_mean,
+        "cond_std": cond_std,
+    }
+    validate_data_bundle(data)
+    return data
+
+
+def validate_data_bundle(data: Dict[str, np.ndarray]) -> None:
+    n = len(data["init_dates"])
+    for k in ("cond_global", "ec_base", "obs_target", "obs_mask", "sst_pcs"):
+        if data[k].shape[0] != n:
+            raise ValueError(f"{k} length mismatch: {data[k].shape[0]} vs {n}")
+
+    if tuple(data["cond_global"].shape[1:]) != (6, 8, 180, 360):
+        raise ValueError(f"cond_global shape invalid: {data['cond_global'].shape}")
+    if tuple(data["ec_base"].shape[1:]) != (6, 1, 120, 140):
+        raise ValueError(f"ec_base shape invalid: {data['ec_base'].shape}")
+    if tuple(data["obs_target"].shape[1:]) != (6, 1, 120, 140):
+        raise ValueError(f"obs_target shape invalid: {data['obs_target'].shape}")
+    if tuple(data["obs_mask"].shape[1:]) != (6, 1, 120, 140):
+        raise ValueError(f"obs_mask shape invalid: {data['obs_mask'].shape}")
+
+    init_dates = pd.to_datetime(data["init_dates"])
+    forbidden = {pd.Timestamp("2011-09-01"), pd.Timestamp("2011-10-01")}
+    if any(d in forbidden for d in init_dates):
+        raise ValueError("init_dates still include 2011-09/2011-10, which must be excluded.")
+
+    # Fast finite checks on slices.
+    idx = [0, len(init_dates) // 2, len(init_dates) - 1]
+    for i in idx:
+        cg = np.asarray(data["cond_global"][i], dtype=np.float32)
+        if not np.isfinite(cg).all():
+            raise ValueError(f"Non-finite values found in cond_global sample {i}")
+        if not np.isfinite(data["ec_base"][i]).all():
+            raise ValueError(f"Non-finite values found in ec_base sample {i}")
+        if not np.isfinite(data["sst_pcs"][i]).all():
+            raise ValueError(f"Non-finite values found in sst_pcs sample {i}")
+
+
+class Hydro6LeadDataset(Dataset):
+    def __init__(self, data: Dict[str, np.ndarray], indices: np.ndarray):
+        self.cond_global = data["cond_global"]
+        self.ec_base = data["ec_base"]
+        self.obs_target = data["obs_target"]
+        self.obs_mask = data["obs_mask"]
+        self.sst_pcs = data["sst_pcs"]
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getitem__(self, i: int):
+        idx = int(self.indices[i])
+        cond = torch.from_numpy(np.asarray(self.cond_global[idx], dtype=np.float32))
+        ec_base = torch.from_numpy(self.ec_base[idx])
+        obs_target = torch.from_numpy(self.obs_target[idx])
+        obs_mask = torch.from_numpy(self.obs_mask[idx])
+        sst_pcs = torch.from_numpy(self.sst_pcs[idx])
+        return cond, ec_base, obs_target, obs_mask, sst_pcs
+
+
+def build_dataloaders(data: Dict[str, np.ndarray], device: torch.device):
+    train_ds = Hydro6LeadDataset(data, data["split_indices"]["train"])
+    val_ds = Hydro6LeadDataset(data, data["split_indices"]["val"])
+    test_ds = Hydro6LeadDataset(data, data["split_indices"]["test"])
+
+    batch_size = int(config.modelconfig.get("batch_size_6lead", 2))
+    num_workers = int(config.modelconfig.get("num_workers_6lead", 0))
+    pin_memory = str(device).startswith("cuda")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    return train_loader, val_loader, test_loader
+
+
+def build_model(data: Dict[str, np.ndarray], device: torch.device) -> model1.GlobalResidualUNet6:
+    cond_channels = int(data["cond_global"].shape[2])
+    pcs_dim = int(data["sst_pcs"].shape[2])
+    model = model1.GlobalResidualUNet6(
+        cond_channels=cond_channels,
+        leads=LEADS,
+        pcs_dim=pcs_dim,
+        channels=tuple(config.modelconfig.get("unet_channels_6lead", [32, 48, 64, 96])),
+        lead_embed_dim=int(config.modelconfig.get("lead_embed_dim_6lead", 8)),
+        global_dim=int(config.modelconfig.get("global_dim_6lead", 64)),
     ).to(device)
     return model
 
 
-def maybe_load_weights(model, device):
+def maybe_load_weights(model: torch.nn.Module, device: torch.device) -> None:
     weight_name = config.modelconfig.get("train_load_weight")
     if not weight_name:
         return
-
     load_dir = config.modelconfig.get("save_weight_dir", config.modelconfig["save_weight_path"])
     ckpt_path = os.path.join(load_dir, weight_name)
     ckpt = torch.load(ckpt_path, map_location=device)
-
     if isinstance(ckpt, dict):
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        elif "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        else:
-            state_dict = ckpt
+        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
     else:
         state_dict = ckpt.state_dict()
-
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(
         f"Loaded checkpoint: {ckpt_path}\n"
@@ -148,184 +493,340 @@ def maybe_load_weights(model, device):
     )
 
 
-def compute_loss(pred, target, mask, crps_weight, crps_samples, nll_weight, mse_weight):
-    # Compute losses in FP32 for better numerical stability when AMP is enabled.
-    pred32 = {k: v.float() for k, v in pred.items()}
-    target32 = target.float()
-    nll = model1.zero_inflated_gamma_nll(pred32, target32)
-    valid = ~mask
-    if valid.any():
-        mse = F.mse_loss(pred32["delta"][valid], target32[valid])
-    else:
-        mse = target32.new_tensor(0.0)
-    if crps_weight > 0:
-        crps = model1.approx_crps_by_sampling(pred32, target32, n_samples=crps_samples)
-    else:
-        crps = target32.new_tensor(0.0)
-    loss = nll_weight * nll + crps_weight * crps + mse_weight * mse
-    return loss, nll, crps, mse
+def compute_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ec_base: torch.Tensor,
+    obs_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    # pred: [B,6,120,140]
+    # target/ec_base/obs_mask: [B,6,1,120,140]
+    target2 = target[:, :, 0]
+    ec2 = ec_base[:, :, 0]
+    mask2 = obs_mask[:, :, 0] > 0.5
+    valid_count = int(mask2.sum().item())
+    if valid_count == 0:
+        zero = pred.new_tensor(0.0)
+        return zero, zero, zero, 0
+
+    huber = model1.masked_huber_loss(pred, target2, mask2, delta=1.0)
+    mse_res = model1.masked_mse_loss(pred - ec2, target2 - ec2, mask2)
+    loss = huber + 0.3 * mse_res
+    return loss, huber, mse_res, valid_count
 
 
-def train():
+def init_metric_state(leads: int = LEADS) -> Dict[str, np.ndarray]:
+    return {
+        "mae_sum": np.zeros(leads, dtype=np.float64),
+        "mse_sum": np.zeros(leads, dtype=np.float64),
+        "count": np.zeros(leads, dtype=np.float64),
+        "acc_sum": np.zeros(leads, dtype=np.float64),
+        "acc_cnt": np.zeros(leads, dtype=np.float64),
+    }
+
+
+def _corrcoef_1d(x: torch.Tensor, y: torch.Tensor) -> float:
+    x = x.float()
+    y = y.float()
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.sqrt((x * x).sum() * (y * y).sum())
+    if denom <= 1e-12:
+        return float("nan")
+    return float(((x * y).sum() / denom).item())
+
+
+def update_metrics(
+    state: Dict[str, np.ndarray],
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    # pred/target/mask: [B,6,120,140], mask bool
+    bsz, leads, _, _ = pred.shape
+    err = pred - target
+    abs_err = torch.abs(err)
+    sq_err = err * err
+
+    for t in range(leads):
+        mt = mask[:, t]
+        count = float(mt.sum().item())
+        if count <= 0:
+            continue
+        state["mae_sum"][t] += float(abs_err[:, t][mt].sum().item())
+        state["mse_sum"][t] += float(sq_err[:, t][mt].sum().item())
+        state["count"][t] += count
+
+    for b in range(bsz):
+        for t in range(leads):
+            mt = mask[b, t]
+            n_valid = int(mt.sum().item())
+            if n_valid < 2:
+                continue
+            c = _corrcoef_1d(pred[b, t][mt], target[b, t][mt])
+            if np.isfinite(c):
+                state["acc_sum"][t] += c
+                state["acc_cnt"][t] += 1.0
+
+
+def finalize_metrics(state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    eps = 1e-12
+    mae = state["mae_sum"] / np.maximum(state["count"], eps)
+    rmse = np.sqrt(state["mse_sum"] / np.maximum(state["count"], eps))
+    acc = state["acc_sum"] / np.maximum(state["acc_cnt"], 1.0)
+    acc[state["acc_cnt"] < 1] = np.nan
+    return {"mae": mae, "rmse": rmse, "acc": acc}
+
+
+def evaluate_baseline(loader: DataLoader, device: torch.device) -> Dict[str, np.ndarray]:
+    state = init_metric_state()
+    with torch.no_grad():
+        for _, ec_base, target, obs_mask, _ in loader:
+            ec_base = ec_base.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            obs_mask = obs_mask.to(device, non_blocking=True)
+            pred = ec_base[:, :, 0]
+            target2 = target[:, :, 0]
+            mask2 = obs_mask[:, :, 0] > 0.5
+            update_metrics(state, pred, target2, mask2)
+    return finalize_metrics(state)
+
+
+def format_metric_line(name: str, values: np.ndarray) -> str:
+    parts = [f"L{i+1}:{float(values[i]):.4f}" if np.isfinite(values[i]) else f"L{i+1}:nan" for i in range(len(values))]
+    return f"{name}: " + ", ".join(parts)
+
+
+def train() -> None:
+    seed = int(config.modelconfig.get("seed", 42))
+    set_seed(seed)
+
     device = config.modelconfig["device"]
-    train_set, test_set = prepare_data()
-    model = build_model(train_set, device)
-    maybe_load_weights(model, device)
+    data = prepare_data()
+    train_loader, val_loader, test_loader = build_dataloaders(data, device=device)
 
-    batch_size = int(config.modelconfig["batch_size"])
-    epochs = int(config.modelconfig["epoch"])
-    lr = float(config.modelconfig.get("lr", 1e-4))
-    weight_decay = float(config.modelconfig.get("weight_decay", 1e-5))
-    grad_clip = float(config.modelconfig.get("grad_clip", 2.0))
-    save_every = int(config.modelconfig.get("save_every", 5))
-    early_stop_patience = int(config.modelconfig.get("early_stop_patience", 30))
-    early_stop_min_delta = float(config.modelconfig.get("early_stop_min_delta", 1e-4))
+    model = build_model(data, device=device)
+    maybe_load_weights(model, device=device)
 
-    nll_weight = float(config.modelconfig.get("nll_weight", 1.0))
-    mse_weight = float(config.modelconfig.get("mse_weight", 0.5))
-    train_crps_weight = float(config.modelconfig.get("crps_weight", 0.0))
-    eval_crps_weight = float(config.modelconfig.get("eval_crps_weight", 0.0))
-    crps_samples = int(config.modelconfig.get("crps_samples", 4))
+    lr = float(config.modelconfig.get("lr_6lead", 3e-4))
+    weight_decay = float(config.modelconfig.get("weight_decay_6lead", 1e-4))
+    epochs = int(config.modelconfig.get("epoch_6lead", 80))
+    grad_accum = int(config.modelconfig.get("grad_accum_6lead", 4))
+    grad_clip = float(config.modelconfig.get("grad_clip_6lead", 1.0))
+    save_every = int(config.modelconfig.get("save_every_6lead", 5))
+    patience = int(config.modelconfig.get("patience_6lead", 12))
+    min_delta = float(config.modelconfig.get("early_stop_min_delta_6lead", 1e-4))
 
-    # GTX 16xx often has poor AMP stability for this workload; keep AMP opt-in.
     use_amp = bool(config.modelconfig.get("use_amp", False)) and str(device).startswith("cuda")
     if use_amp and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         if major < 8:
             print(
-                f"AMP disabled automatically on this GPU (compute capability {major}.{minor}) "
-                "for numerical stability. Set use_amp=False explicitly in config."
+                f"AMP disabled on this GPU (compute capability {major}.{minor}) for stability."
             )
             use_amp = False
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True, drop_last=True
-    )
-    test_loader = DataLoader(
-        test_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True
-    )
     writer = SummaryWriter(log_dir=config.modelconfig["log_path"])
 
     print(
         "Train setup:",
         {
             "device": str(device),
-            "batch_size": batch_size,
+            "batch_size": train_loader.batch_size,
             "epochs": epochs,
+            "grad_accum": grad_accum,
+            "lr": lr,
+            "weight_decay": weight_decay,
             "use_amp": use_amp,
-            "train_crps_weight": train_crps_weight,
-            "eval_crps_weight": eval_crps_weight,
-            "crps_samples": crps_samples,
-            "early_stop_patience": early_stop_patience,
         },
     )
 
-    best_test_loss = float("inf")
-    early_stop_counter = 0
+    baseline_val = evaluate_baseline(val_loader, device=device)
+    baseline_test = evaluate_baseline(test_loader, device=device)
+    print(format_metric_line("Baseline VAL RMSE", baseline_val["rmse"]))
+    print(format_metric_line("Baseline TEST RMSE", baseline_test["rmse"]))
 
-    for e in range(epochs):
+    best_val_loss = float("inf")
+    best_epoch = -1
+    stale_epochs = 0
+
+    global_step = 0
+    for epoch in range(epochs):
         model.train()
-        train_loss = []
-        train_acc = {i: [] for i in range(6)}
+        train_losses: List[float] = []
+        train_state = init_metric_state()
+        skipped_batches = 0
 
-        for target, cond, mask, pcs in tqdm.tqdm(train_loader, desc=f"Epoch {e}"):
-            target = target.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        accum_counter = 0
+        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}")
+        for step, (cond, ec_base, target, obs_mask, sst_pcs) in enumerate(pbar):
             cond = cond.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-            pcs = pcs.to(device, non_blocking=True)
+            ec_base = ec_base.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            obs_mask = obs_mask.to(device, non_blocking=True)
+            sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                pred = model(cond, sst_pcs=pcs)
-                loss, nll, crps, mse = compute_loss(
-                    pred=pred,
-                    target=target,
-                    mask=mask,
-                    crps_weight=train_crps_weight,
-                    crps_samples=crps_samples,
-                    nll_weight=nll_weight,
-                    mse_weight=mse_weight,
-                )
-            if any((~torch.isfinite(v)).any().item() for v in pred.values()) or (not torch.isfinite(loss).item()):
+                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+                loss, huber, mse_res, valid_count = compute_loss(pred, target, ec_base, obs_mask)
+
+            if valid_count == 0:
+                skipped_batches += 1
+                continue
+
+            if (not torch.isfinite(pred).all().item()) or (not torch.isfinite(loss).item()):
                 raise FloatingPointError(
-                    "Non-finite values detected in training forward pass. "
-                    "Please set config.modelconfig['use_amp'] = False."
+                    "Non-finite values detected in training. "
+                    "Check input normalization and keep use_amp=False."
                 )
 
-            scaler.scale(loss).backward()
+            scaled_loss = loss / max(1, grad_accum)
+            scaler.scale(scaled_loss).backward()
+            accum_counter += 1
+
+            do_step = accum_counter >= max(1, grad_accum)
+            if do_step:
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                accum_counter = 0
+
+            train_losses.append(float(loss.item()))
+            pred_det = pred.detach()
+            target_det = target[:, :, 0].detach()
+            mask_det = (obs_mask[:, :, 0] > 0.5).detach()
+            update_metrics(train_state, pred_det, target_det, mask_det)
+
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                huber=f"{huber.item():.4f}",
+                mse=f"{mse_res.item():.4f}",
+                skipped=skipped_batches,
+            )
+            global_step += 1
+
+        if accum_counter > 0:
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-            train_loss.append(loss.item())
-
-            pred_mean = pred["delta"] + (1.0 - pred["p0"]) * pred["alpha"] * pred["beta"]
-            for i in range(pred_mean.shape[2]):
-                acc = utils.cal_acc(pred_mean[:, 0, i], target[:, 0, i]).mean()
-                train_acc[i].append(acc.item())
-
-        for i in range(6):
-            writer.add_scalar(f"Acc/train_t{i}", np.mean(train_acc[i]), e)
-        writer.add_scalar("Loss/train", np.mean(train_loss), e)
-        print(f"Epoch {e} train loss: {np.mean(train_loss):.4f}")
+        train_metrics = finalize_metrics(train_state)
+        train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
 
         model.eval()
-        test_loss = []
-        test_acc = {i: [] for i in range(6)}
+        val_losses: List[float] = []
+        val_state = init_metric_state()
         with torch.no_grad():
-            for target, cond, mask, pcs in test_loader:
-                target = target.to(device, non_blocking=True)
+            for cond, ec_base, target, obs_mask, sst_pcs in val_loader:
                 cond = cond.to(device, non_blocking=True)
-                mask = mask.to(device, non_blocking=True)
-                pcs = pcs.to(device, non_blocking=True)
+                ec_base = ec_base.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                obs_mask = obs_mask.to(device, non_blocking=True)
+                sst_pcs = sst_pcs.to(device, non_blocking=True)
 
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    pred = model(cond, sst_pcs=pcs)
-                    loss, nll, crps, mse = compute_loss(
-                        pred=pred,
-                        target=target,
-                        mask=mask,
-                        crps_weight=eval_crps_weight,
-                        crps_samples=crps_samples,
-                        nll_weight=nll_weight,
-                        mse_weight=mse_weight,
-                    )
-                if any((~torch.isfinite(v)).any().item() for v in pred.values()) or (not torch.isfinite(loss).item()):
+                    pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+                    loss, _, _, valid_count = compute_loss(pred, target, ec_base, obs_mask)
+
+                if valid_count == 0:
+                    continue
+                if (not torch.isfinite(pred).all().item()) or (not torch.isfinite(loss).item()):
                     raise FloatingPointError(
-                        "Non-finite values detected in validation forward pass. "
-                        "Please set config.modelconfig['use_amp'] = False."
+                        "Non-finite values detected in validation. "
+                        "Check input normalization and keep use_amp=False."
                     )
 
-                test_loss.append(loss.item())
-                pred_mean = pred["delta"] + (1.0 - pred["p0"]) * pred["alpha"] * pred["beta"]
-                for i in range(pred_mean.shape[2]):
-                    acc = utils.cal_acc(pred_mean[:, 0, i], target[:, 0, i]).mean()
-                    test_acc[i].append(acc.item())
+                val_losses.append(float(loss.item()))
+                update_metrics(val_state, pred, target[:, :, 0], obs_mask[:, :, 0] > 0.5)
 
-        for i in range(6):
-            writer.add_scalar(f"Acc/test_t{i}", np.mean(test_acc[i]), e)
-        epoch_test_loss = np.mean(test_loss)
-        writer.add_scalar("Loss/test", epoch_test_loss, e)
-        print(f"Epoch {e} test loss: {epoch_test_loss:.4f}")
+        val_metrics = finalize_metrics(val_state)
+        val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
 
-        if e % save_every == 0:
-            save_path = os.path.join(config.modelconfig["save_weight_path"], f"epoch_{e}.pt")
-            torch.save(model.state_dict(), save_path)
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/val", val_loss, epoch)
+        for lead in range(LEADS):
+            writer.add_scalar(f"RMSE/train_lead{lead+1}", train_metrics["rmse"][lead], epoch)
+            writer.add_scalar(f"RMSE/val_lead{lead+1}", val_metrics["rmse"][lead], epoch)
+            writer.add_scalar(f"ACC/train_lead{lead+1}", train_metrics["acc"][lead], epoch)
+            writer.add_scalar(f"ACC/val_lead{lead+1}", val_metrics["acc"][lead], epoch)
 
-        if epoch_test_loss + early_stop_min_delta < best_test_loss:
-            best_test_loss = epoch_test_loss
-            early_stop_counter = 0
+        print(f"Epoch {epoch}: train_loss={train_loss:.5f}, val_loss={val_loss:.5f}, skipped={skipped_batches}")
+        print(format_metric_line("VAL RMSE", val_metrics["rmse"]))
+        print(format_metric_line("VAL ACC", val_metrics["acc"]))
+        skill = baseline_val["rmse"] - val_metrics["rmse"]
+        print(format_metric_line("VAL RMSE Skill (baseline-model)", skill))
+
+        if epoch % max(1, save_every) == 0:
+            ckpt_path = os.path.join(config.modelconfig["save_weight_path"], f"epoch_{epoch}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                ckpt_path,
+            )
+
+        if val_loss + min_delta < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            stale_epochs = 0
             best_path = os.path.join(config.modelconfig["save_weight_path"], "best.pt")
-            torch.save(model.state_dict(), best_path)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                },
+                best_path,
+            )
         else:
-            early_stop_counter += 1
-            if early_stop_counter >= early_stop_patience:
-                print(f"Early stopping at epoch {e}: best test loss = {best_test_loss:.6f}")
+            stale_epochs += 1
+            if stale_epochs >= patience:
+                print(f"Early stopping at epoch {epoch}. best_epoch={best_epoch}, best_val_loss={best_val_loss:.6f}")
                 break
+
+    # Final test eval with best checkpoint.
+    best_path = os.path.join(config.modelconfig["save_weight_path"], "best.pt")
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+    model.eval()
+    test_losses: List[float] = []
+    test_state = init_metric_state()
+    with torch.no_grad():
+        for cond, ec_base, target, obs_mask, sst_pcs in test_loader:
+            cond = cond.to(device, non_blocking=True)
+            ec_base = ec_base.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            obs_mask = obs_mask.to(device, non_blocking=True)
+            sst_pcs = sst_pcs.to(device, non_blocking=True)
+
+            pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+            loss, _, _, valid_count = compute_loss(pred, target, ec_base, obs_mask)
+            if valid_count == 0:
+                continue
+            test_losses.append(float(loss.item()))
+            update_metrics(test_state, pred, target[:, :, 0], obs_mask[:, :, 0] > 0.5)
+
+    test_metrics = finalize_metrics(test_state)
+    test_loss = float(np.mean(test_losses)) if test_losses else float("inf")
+    print(f"Final TEST loss={test_loss:.5f}")
+    print(format_metric_line("TEST RMSE", test_metrics["rmse"]))
+    print(format_metric_line("TEST ACC", test_metrics["acc"]))
+    test_skill = baseline_test["rmse"] - test_metrics["rmse"]
+    print(format_metric_line("TEST RMSE Skill (baseline-model)", test_skill))
 
     writer.close()
 
