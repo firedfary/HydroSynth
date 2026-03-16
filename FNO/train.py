@@ -12,11 +12,12 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 import tqdm
 
-# Ensure project root is on sys.path so absolute imports like 'HydroSynth' work.
-_proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_proj_root = os.path.normpath(_proj_root)
-if _proj_root not in sys.path:
-    sys.path.insert(0, _proj_root)
+# Ensure repo parent is on sys.path so absolute imports like 'HydroSynth' work.
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_repo_root = os.path.normpath(_repo_root)
+_repo_parent = os.path.dirname(_repo_root)
+if _repo_parent not in sys.path:
+    sys.path.insert(0, _repo_parent)
 
 from HydroSynth import config
 try:
@@ -430,8 +431,8 @@ def build_dataloaders(data: Dict[str, np.ndarray], device: torch.device):
     val_ds = Hydro6LeadDataset(data, data["split_indices"]["val"])
     test_ds = Hydro6LeadDataset(data, data["split_indices"]["test"])
 
-    batch_size = int(config.modelconfig.get("batch_size_6lead", 2))
-    num_workers = int(config.modelconfig.get("num_workers_6lead", 0))
+    batch_size = int(config.modelconfig.get("batch_size", 2))
+    num_workers = int(config.modelconfig.get("num_workers", 0))
     pin_memory = str(device).startswith("cuda")
 
     train_loader = DataLoader(
@@ -476,10 +477,10 @@ def build_model(data: Dict[str, np.ndarray], device: torch.device) -> model1.Glo
 
 
 def maybe_load_weights(model: torch.nn.Module, device: torch.device) -> None:
-    weight_name = config.modelconfig.get("train_load_weight")
+    weight_name = "epoch_500.pt"
     if not weight_name:
         return
-    load_dir = config.modelconfig.get("save_weight_dir", config.modelconfig["save_weight_path"])
+    load_dir = r"D:\workplace\conv_data\weight_t0\run_20260316_184706"
     ckpt_path = os.path.join(load_dir, weight_name)
     ckpt = torch.load(ckpt_path, map_location=device)
     if isinstance(ckpt, dict):
@@ -608,14 +609,14 @@ def train() -> None:
     model = build_model(data, device=device)
     maybe_load_weights(model, device=device)
 
-    lr = float(config.modelconfig.get("lr_6lead", 3e-4))
-    weight_decay = float(config.modelconfig.get("weight_decay_6lead", 1e-4))
-    epochs = int(config.modelconfig.get("epoch_6lead", 80))
-    grad_accum = int(config.modelconfig.get("grad_accum_6lead", 4))
-    grad_clip = float(config.modelconfig.get("grad_clip_6lead", 1.0))
-    save_every = int(config.modelconfig.get("save_every_6lead", 5))
-    patience = int(config.modelconfig.get("patience_6lead", 12))
-    min_delta = float(config.modelconfig.get("early_stop_min_delta_6lead", 1e-4))
+    lr = float(config.modelconfig.get("lr", 3e-4))
+    weight_decay = float(config.modelconfig.get("weight_decay", 1e-4))
+    epochs = int(config.modelconfig.get("epoch", 80))
+    grad_accum = int(config.modelconfig.get("grad_accum", 4))
+    grad_clip = float(config.modelconfig.get("grad_clip", 1.0))
+    save_every = int(config.modelconfig.get("save_every", 5))
+    patience = int(config.modelconfig.get("patience", 12))
+    min_delta = float(config.modelconfig.get("early_stop_min_delta", 1e-4))
 
     use_amp = bool(config.modelconfig.get("use_amp", False)) and str(device).startswith("cuda")
     if use_amp and torch.cuda.is_available():
@@ -763,7 +764,9 @@ def train() -> None:
         print(format_metric_line("VAL RMSE", val_metrics["rmse"]))
         print(format_metric_line("VAL ACC", val_metrics["acc"]))
         skill = baseline_val["rmse"] - val_metrics["rmse"]
-        print(format_metric_line("VAL RMSE Skill (baseline-model)", skill))
+        acc_diff = val_metrics["acc"] - baseline_val["acc"]
+        print(format_metric_line("VAL RMSE Skill (baseline-model)", skill)) # skill > 0 means model is better than baseline
+        print(format_metric_line("VAL ACC Skill (baseline-model)", acc_diff)) # acc_diff > 0 means model is better than baseline
 
         if epoch % max(1, save_every) == 0:
             ckpt_path = os.path.join(config.modelconfig["save_weight_path"], f"epoch_{epoch}.pt")
@@ -794,7 +797,7 @@ def train() -> None:
             stale_epochs += 1
             if stale_epochs >= patience:
                 print(f"Early stopping at epoch {epoch}. best_epoch={best_epoch}, best_val_loss={best_val_loss:.6f}")
-                break
+                # break
 
     # Final test eval with best checkpoint.
     best_path = os.path.join(config.modelconfig["save_weight_path"], "best.pt")

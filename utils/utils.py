@@ -283,7 +283,7 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
 
 
 
-def read_nc_to_npy(start: int, end: int, data_path: str = "E:\D1\data\MODESv21_ecmwf_seas51") -> list:
+def read_nc_to_npy(start: int, end: int, data_path: str = "D:\data\MODESv21_ecmwf_seas51") -> list:
     start_year = int(str(start)[0:4])
     end_year = int(str(end)[0:4])
     start_month = int(str(start)[4:6])

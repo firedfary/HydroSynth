@@ -14,7 +14,7 @@ save_weight_foldr = "weight_t0"
 picture_foldr = "picture"
 log_foldr = "log_ind"
 
-local_data_path = "e:/D1/diffusion/HydroSynth/datas/conv_data/"
+local_data_path = "d:/workplace/conv_data/"
 colab_data_path = "/content/drive/MyDrive/my_models/my_model_data/"
 
 
