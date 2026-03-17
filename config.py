@@ -48,7 +48,7 @@ modelconfig = {
     "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
     "batch_size": 16,
     "T": 200,
-    "channel": 64,
+    "channels": [8, 16, 32, 64],
     "channel_mult": [2, 4, 4, 2],
     "atten": [0, 1, 2, 3],
     "num_res_block": 6,
@@ -58,7 +58,7 @@ modelconfig = {
     "eval_load_weight": "ckptunet_1.pt",
     "picture_save_path": picture_save_path,
     "log_path": log_path,
-    "lr": 0.0005,
+    "lr": 0.00005,
     "epoch": 502,
     "multiplier": 1.0,
     "bata_1": 0.0001,
@@ -74,6 +74,15 @@ modelconfig = {
     "pc_window": 1,
     "pc_step": 1,
     "horizon": 6,
+    "num_workers": 0,
+    "lead_embed_dim": 8,
+    "global_dim": 64,
+    "seed": 42,
+    "weight_decay": 0.0001,
+    "grad_accum": 1,
+    "save_every": 5,
+    "patience": 12,
+    "early_stop_min_delta": 0.0001,
 }
 
 

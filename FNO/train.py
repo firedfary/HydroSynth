@@ -303,7 +303,7 @@ def prepare_data() -> Dict[str, np.ndarray]:
         raise ValueError(f"sst_file shape must be [N,6,H,W], got {sst_raw.shape}")
 
     init_dates_full = build_init_dates()
-    n = min(cond_raw.shape[0], ec_anomaly.shape[0], sst_raw.shape[0], len(init_dates_full), 366)
+    n = min(cond_raw.shape[0], ec_anomaly.shape[0], sst_raw.shape[0], len(init_dates_full))
     if n < 300:
         raise ValueError(f"Aligned sample count too small: {n}")
 
@@ -348,7 +348,7 @@ def prepare_data() -> Dict[str, np.ndarray]:
         cache_path=cond_cache_path,
     )  # [N,6,8,180,360], float16 memmap
 
-    n_pcs = int(config.modelconfig.get("n_pcs", 8))
+    n_pcs = int(config.modelconfig["n_pcs"])
     pcs_cache_path = os.path.join(lr_path, f"sst_pcs_eof_k{n_pcs}_n{n}.npy")
     sst_pcs = compute_sst_pcs(
         sst_raw=sst_raw,
@@ -431,8 +431,8 @@ def build_dataloaders(data: Dict[str, np.ndarray], device: torch.device):
     val_ds = Hydro6LeadDataset(data, data["split_indices"]["val"])
     test_ds = Hydro6LeadDataset(data, data["split_indices"]["test"])
 
-    batch_size = int(config.modelconfig.get("batch_size", 2))
-    num_workers = int(config.modelconfig.get("num_workers", 0))
+    batch_size = int(config.modelconfig["batch_size"])
+    num_workers = int(config.modelconfig["num_workers"])
     pin_memory = str(device).startswith("cuda")
 
     train_loader = DataLoader(
@@ -469,15 +469,16 @@ def build_model(data: Dict[str, np.ndarray], device: torch.device) -> model1.Glo
         cond_channels=cond_channels,
         leads=LEADS,
         pcs_dim=pcs_dim,
-        channels=tuple(config.modelconfig.get("unet_channels_6lead", [32, 48, 64, 96])),
-        lead_embed_dim=int(config.modelconfig.get("lead_embed_dim_6lead", 8)),
-        global_dim=int(config.modelconfig.get("global_dim_6lead", 64)),
+        channels=tuple(config.modelconfig["channels"]),
+        lead_embed_dim=int(config.modelconfig["lead_embed_dim"]),
+        global_dim=int(config.modelconfig["global_dim"]),
     ).to(device)
     return model
 
 
 def maybe_load_weights(model: torch.nn.Module, device: torch.device) -> None:
-    weight_name = "epoch_500.pt"
+    # weight_name = "epoch_500.pt"
+    weight_name = None
     if not weight_name:
         return
     load_dir = r"D:\workplace\conv_data\weight_t0\run_20260316_184706"
@@ -599,7 +600,7 @@ def format_metric_line(name: str, values: np.ndarray) -> str:
 
 
 def train() -> None:
-    seed = int(config.modelconfig.get("seed", 42))
+    seed = int(config.modelconfig["seed"])
     set_seed(seed)
 
     device = config.modelconfig["device"]
@@ -609,24 +610,14 @@ def train() -> None:
     model = build_model(data, device=device)
     maybe_load_weights(model, device=device)
 
-    lr = float(config.modelconfig.get("lr", 3e-4))
-    weight_decay = float(config.modelconfig.get("weight_decay", 1e-4))
-    epochs = int(config.modelconfig.get("epoch", 80))
-    grad_accum = int(config.modelconfig.get("grad_accum", 4))
-    grad_clip = float(config.modelconfig.get("grad_clip", 1.0))
-    save_every = int(config.modelconfig.get("save_every", 5))
-    patience = int(config.modelconfig.get("patience", 12))
-    min_delta = float(config.modelconfig.get("early_stop_min_delta", 1e-4))
-
-    use_amp = bool(config.modelconfig.get("use_amp", False)) and str(device).startswith("cuda")
-    if use_amp and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        if major < 8:
-            print(
-                f"AMP disabled on this GPU (compute capability {major}.{minor}) for stability."
-            )
-            use_amp = False
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    lr = float(config.modelconfig["lr"])
+    weight_decay = float(config.modelconfig["weight_decay"])
+    epochs = int(config.modelconfig["epoch"])
+    grad_accum = int(config.modelconfig["grad_accum"])
+    grad_clip = float(config.modelconfig["grad_clip"])
+    save_every = int(config.modelconfig["save_every"])
+    patience = int(config.modelconfig["patience"])
+    min_delta = float(config.modelconfig["early_stop_min_delta"])
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     writer = SummaryWriter(log_dir=config.modelconfig["log_path"])
@@ -640,7 +631,6 @@ def train() -> None:
             "grad_accum": grad_accum,
             "lr": lr,
             "weight_decay": weight_decay,
-            "use_amp": use_amp,
         },
     )
 
@@ -670,9 +660,8 @@ def train() -> None:
             obs_mask = obs_mask.to(device, non_blocking=True)
             sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
-                loss, huber, mse_res, valid_count = compute_loss(pred, target, ec_base, obs_mask)
+            pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+            loss, huber, mse_res, valid_count = compute_loss(pred, target, ec_base, obs_mask)
 
             if valid_count == 0:
                 skipped_batches += 1
@@ -681,20 +670,18 @@ def train() -> None:
             if (not torch.isfinite(pred).all().item()) or (not torch.isfinite(loss).item()):
                 raise FloatingPointError(
                     "Non-finite values detected in training. "
-                    "Check input normalization and keep use_amp=False."
+                    "Check input normalization."
                 )
 
             scaled_loss = loss / max(1, grad_accum)
-            scaler.scale(scaled_loss).backward()
+            scaled_loss.backward()
             accum_counter += 1
 
             do_step = accum_counter >= max(1, grad_accum)
             if do_step:
                 if grad_clip > 0:
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 accum_counter = 0
 
@@ -714,10 +701,8 @@ def train() -> None:
 
         if accum_counter > 0:
             if grad_clip > 0:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         train_metrics = finalize_metrics(train_state)
@@ -734,16 +719,15 @@ def train() -> None:
                 obs_mask = obs_mask.to(device, non_blocking=True)
                 sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
-                    loss, _, _, valid_count = compute_loss(pred, target, ec_base, obs_mask)
+                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+                loss, _, _, valid_count = compute_loss(pred, target, ec_base, obs_mask)
 
                 if valid_count == 0:
                     continue
                 if (not torch.isfinite(pred).all().item()) or (not torch.isfinite(loss).item()):
                     raise FloatingPointError(
                         "Non-finite values detected in validation. "
-                        "Check input normalization and keep use_amp=False."
+                        "Check input normalization."
                     )
 
                 val_losses.append(float(loss.item()))
