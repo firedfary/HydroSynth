@@ -200,17 +200,12 @@ def build_or_load_cond_global(
 ) -> np.ndarray:
     expected_shape = (n_samples, LEADS, len(COND_VARS) + 1, 180, 360)
     if os.path.exists(cache_path):
-        cached = np.load(cache_path, mmap_mode="r")
+        cached = np.load(cache_path)
         if tuple(cached.shape) == expected_shape:
-            return cached
+            return cached.astype(np.float32)
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    out = np.lib.format.open_memmap(
-        cache_path,
-        mode="w+",
-        dtype=np.float16,
-        shape=expected_shape,
-    )
+    out = np.zeros(expected_shape, dtype=np.float32)
 
     for i in tqdm.tqdm(range(n_samples), desc="Build cond_global cache"):
         x = cond_raw[i].astype(np.float32)  # [7,6,180,360]
@@ -224,11 +219,10 @@ def build_or_load_cond_global(
 
         x = np.concatenate([x, sst_valid[None, ...]], axis=0)  # [8,6,180,360]
         x = np.transpose(x, (1, 0, 2, 3))  # [6,8,180,360]
-        out[i] = x.astype(np.float16)
+        out[i] = x
 
-    out.flush()
-    del out
-    return np.load(cache_path, mmap_mode="r")
+    np.save(cache_path, out)
+    return out
 
 
 def compute_sst_pcs(
@@ -291,9 +285,9 @@ def prepare_data() -> Dict[str, np.ndarray]:
     anomaly_path = os.path.join(lr_path, "anomaly.npy")
     sst_path = config.modelconfig["sst_file"]
 
-    cond_raw = np.load(cond_path, mmap_mode="r")
-    ec_anomaly = np.load(anomaly_path, mmap_mode="r")
-    sst_raw = np.load(sst_path, mmap_mode="r")
+    cond_raw = np.load(cond_path)
+    ec_anomaly = np.load(anomaly_path)
+    sst_raw = np.load(sst_path)
 
     if cond_raw.ndim != 5 or cond_raw.shape[1:3] != (7, 6):
         raise ValueError(f"cond.npy shape must be [N,7,6,180,360], got {cond_raw.shape}")
@@ -339,14 +333,14 @@ def prepare_data() -> Dict[str, np.ndarray]:
     obs_mask = obs_mask[:, :, None, :, :].astype(np.float32)
 
     cond_mean, cond_std = compute_cond_stats(cond_raw=cond_raw, train_idx=splits["train"])
-    cond_cache_path = os.path.join(lr_path, f"cond_global_norm_clip6_fp16_n{n}.npy")
+    cond_cache_path = os.path.join(lr_path, f"cond_global_norm_clip6_fp32_n{n}.npy")
     cond_global = build_or_load_cond_global(
         cond_raw=cond_raw,
         mean=cond_mean,
         std=cond_std,
         n_samples=n,
         cache_path=cond_cache_path,
-    )  # [N,6,8,180,360], float16 memmap
+    )  # [N,6,8,180,360], float32 in-memory
 
     n_pcs = int(config.modelconfig["n_pcs"])
     pcs_cache_path = os.path.join(lr_path, f"sst_pcs_eof_k{n_pcs}_n{n}.npy")
@@ -418,7 +412,7 @@ class Hydro6LeadDataset(Dataset):
 
     def __getitem__(self, i: int):
         idx = int(self.indices[i])
-        cond = torch.from_numpy(np.asarray(self.cond_global[idx], dtype=np.float32))
+        cond = torch.from_numpy(self.cond_global[idx])
         ec_base = torch.from_numpy(self.ec_base[idx])
         obs_target = torch.from_numpy(self.obs_target[idx])
         obs_mask = torch.from_numpy(self.obs_mask[idx])
@@ -613,7 +607,6 @@ def train() -> None:
     lr = float(config.modelconfig["lr"])
     weight_decay = float(config.modelconfig["weight_decay"])
     epochs = int(config.modelconfig["epoch"])
-    grad_accum = int(config.modelconfig["grad_accum"])
     grad_clip = float(config.modelconfig["grad_clip"])
     save_every = int(config.modelconfig["save_every"])
     patience = int(config.modelconfig["patience"])
@@ -628,7 +621,6 @@ def train() -> None:
             "device": str(device),
             "batch_size": train_loader.batch_size,
             "epochs": epochs,
-            "grad_accum": grad_accum,
             "lr": lr,
             "weight_decay": weight_decay,
         },
@@ -651,7 +643,6 @@ def train() -> None:
         skipped_batches = 0
 
         optimizer.zero_grad(set_to_none=True)
-        accum_counter = 0
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}")
         for step, (cond, ec_base, target, obs_mask, sst_pcs) in enumerate(pbar):
             cond = cond.to(device, non_blocking=True)
@@ -673,17 +664,11 @@ def train() -> None:
                     "Check input normalization."
                 )
 
-            scaled_loss = loss / max(1, grad_accum)
-            scaled_loss.backward()
-            accum_counter += 1
-
-            do_step = accum_counter >= max(1, grad_accum)
-            if do_step:
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                accum_counter = 0
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
             train_losses.append(float(loss.item()))
             pred_det = pred.detach()
@@ -698,12 +683,6 @@ def train() -> None:
                 skipped=skipped_batches,
             )
             global_step += 1
-
-        if accum_counter > 0:
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
 
         train_metrics = finalize_metrics(train_state)
         train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
