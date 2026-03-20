@@ -82,6 +82,12 @@ modelconfig = {
     "save_every": 5,
     "patience": 12,
     "early_stop_min_delta": 0.0001,
+    "autoregressive": True,
+    "ssr_start": 1.0,
+    "ssr_end": 0.0,
+    "ssr_decay_epochs": 30,
+    "prev_pred_init": "ec_base",
+    "detach_rollout": False,
 }
 
 

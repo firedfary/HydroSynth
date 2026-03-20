@@ -1,7 +1,7 @@
 import os
 import random
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -511,6 +511,63 @@ def compute_loss(
     return loss, huber, mse_res, valid_count
 
 
+def _ssr_ratio(epoch: int, start: float, end: float, decay_epochs: int) -> float:
+    if decay_epochs <= 0:
+        return float(end)
+    if start <= end:
+        return float(end)
+    progress = min(max(epoch, 0), decay_epochs) / float(decay_epochs)
+    return float(max(end, start - (start - end) * progress))
+
+
+def _init_prev_pred(ec_base: torch.Tensor, mode: str) -> torch.Tensor:
+    # ec_base: [B,T,1,H,W]
+    if mode == "ec_base":
+        return ec_base[:, 0, 0]
+    if mode == "zero":
+        return ec_base.new_zeros((ec_base.shape[0], ec_base.shape[-2], ec_base.shape[-1]))
+    raise ValueError(f"Unknown prev_pred_init mode: {mode}")
+
+
+def autoregressive_rollout(
+    model: torch.nn.Module,
+    cond: torch.Tensor,
+    ec_base: torch.Tensor,
+    sst_pcs: Optional[torch.Tensor],
+    target: Optional[torch.Tensor],
+    teacher_forcing_ratio: float,
+    detach_rollout: bool,
+    prev_pred_init: str,
+) -> torch.Tensor:
+    # cond: [B,T,C,180,360], ec_base/target: [B,T,1,120,140], sst_pcs: [B,T,K]
+    bsz, tdim = cond.shape[0], cond.shape[1]
+    prev_pred = _init_prev_pred(ec_base, prev_pred_init)
+    preds: List[torch.Tensor] = []
+
+    for t in range(tdim):
+        if t == 0:
+            prev_in = prev_pred
+        else:
+            if target is not None and teacher_forcing_ratio > 0.0:
+                use_teacher = torch.rand(bsz, device=cond.device) < teacher_forcing_ratio
+                prev_in = torch.where(use_teacher[:, None, None], target[:, t - 1, 0], prev_pred)
+            else:
+                prev_in = prev_pred
+
+        sst_t = None if sst_pcs is None else sst_pcs[:, t]
+        pred_t = model.forward_step(
+            cond[:, t],
+            ec_base_t=ec_base[:, t],
+            sst_pcs_t=sst_t,
+            prev_pred=prev_in,
+            lead_id=t,
+        )
+        preds.append(pred_t)
+        prev_pred = pred_t.detach() if detach_rollout else pred_t
+
+    return torch.stack(preds, dim=1)
+
+
 def init_metric_state(leads: int = LEADS) -> Dict[str, np.ndarray]:
     return {
         "mae_sum": np.zeros(leads, dtype=np.float64),
@@ -611,6 +668,12 @@ def train() -> None:
     save_every = int(config.modelconfig["save_every"])
     patience = int(config.modelconfig["patience"])
     min_delta = float(config.modelconfig["early_stop_min_delta"])
+    autoregressive = bool(config.modelconfig.get("autoregressive", False))
+    ssr_start = float(config.modelconfig.get("ssr_start", 1.0))
+    ssr_end = float(config.modelconfig.get("ssr_end", 0.0))
+    ssr_decay_epochs = int(config.modelconfig.get("ssr_decay_epochs", 30))
+    prev_pred_init = str(config.modelconfig.get("prev_pred_init", "ec_base"))
+    detach_rollout = bool(config.modelconfig.get("detach_rollout", False))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     writer = SummaryWriter(log_dir=config.modelconfig["log_path"])
@@ -623,6 +686,7 @@ def train() -> None:
             "epochs": epochs,
             "lr": lr,
             "weight_decay": weight_decay,
+            "autoregressive": autoregressive,
         },
     )
 
@@ -641,6 +705,7 @@ def train() -> None:
         train_losses: List[float] = []
         train_state = init_metric_state()
         skipped_batches = 0
+        teacher_forcing_ratio = _ssr_ratio(epoch, ssr_start, ssr_end, ssr_decay_epochs) if autoregressive else 0.0
 
         optimizer.zero_grad(set_to_none=True)
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}")
@@ -651,7 +716,19 @@ def train() -> None:
             obs_mask = obs_mask.to(device, non_blocking=True)
             sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-            pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+            if autoregressive:
+                pred = autoregressive_rollout(
+                    model=model,
+                    cond=cond,
+                    ec_base=ec_base,
+                    sst_pcs=sst_pcs,
+                    target=target,
+                    teacher_forcing_ratio=teacher_forcing_ratio,
+                    detach_rollout=detach_rollout,
+                    prev_pred_init=prev_pred_init,
+                )
+            else:
+                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
             loss, huber, mse_res, valid_count = compute_loss(pred, target, ec_base, obs_mask)
 
             if valid_count == 0:
@@ -698,7 +775,19 @@ def train() -> None:
                 obs_mask = obs_mask.to(device, non_blocking=True)
                 sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+                if autoregressive:
+                    pred = autoregressive_rollout(
+                        model=model,
+                        cond=cond,
+                        ec_base=ec_base,
+                        sst_pcs=sst_pcs,
+                        target=None,
+                        teacher_forcing_ratio=0.0,
+                        detach_rollout=True,
+                        prev_pred_init=prev_pred_init,
+                    )
+                else:
+                    pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
                 loss, _, _, valid_count = compute_loss(pred, target, ec_base, obs_mask)
 
                 if valid_count == 0:
@@ -779,7 +868,19 @@ def train() -> None:
             obs_mask = obs_mask.to(device, non_blocking=True)
             sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-            pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+            if autoregressive:
+                pred = autoregressive_rollout(
+                    model=model,
+                    cond=cond,
+                    ec_base=ec_base,
+                    sst_pcs=sst_pcs,
+                    target=None,
+                    teacher_forcing_ratio=0.0,
+                    detach_rollout=True,
+                    prev_pred_init=prev_pred_init,
+                )
+            else:
+                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
             loss, _, _, valid_count = compute_loss(pred, target, ec_base, obs_mask)
             if valid_count == 0:
                 continue

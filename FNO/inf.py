@@ -106,6 +106,8 @@ def run_inference() -> str:
     model = train.build_model(data, device=device)
     _load_weights(model, device=device)
     model.eval()
+    autoregressive = bool(config.modelconfig.get("autoregressive", False))
+    prev_pred_init = str(config.modelconfig.get("prev_pred_init", "ec_base"))
 
     preds: List[np.ndarray] = []
     with torch.no_grad():
@@ -114,7 +116,19 @@ def run_inference() -> str:
             ec_base = ec_base.to(device, non_blocking=True)
             sst_pcs = sst_pcs.to(device, non_blocking=True)
 
-            pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
+            if autoregressive:
+                pred = train.autoregressive_rollout(
+                    model=model,
+                    cond=cond,
+                    ec_base=ec_base,
+                    sst_pcs=sst_pcs,
+                    target=None,
+                    teacher_forcing_ratio=0.0,
+                    detach_rollout=True,
+                    prev_pred_init=prev_pred_init,
+                )
+            else:
+                pred = model(cond, ec_base=ec_base, sst_pcs=sst_pcs)
             preds.append(pred.detach().cpu().numpy())
 
     all_pred = np.concatenate(preds, axis=0)
