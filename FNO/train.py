@@ -694,6 +694,8 @@ def train() -> None:
     baseline_test = evaluate_baseline(test_loader, device=device)
     print(format_metric_line("Baseline VAL RMSE", baseline_val["rmse"]))
     print(format_metric_line("Baseline TEST RMSE", baseline_test["rmse"]))
+    print(format_metric_line("Baseline VAL ACC", baseline_val["acc"]))
+    print(format_metric_line("Baseline TEST ACC", baseline_test["acc"]))
 
     best_val_loss = float("inf")
     best_epoch = -1

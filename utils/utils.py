@@ -209,7 +209,7 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
 
 
     # 地图界限
-    with open("E:\D1/f01\data\CN-border-La.gmt") as src:
+    with open(r"E:\HydroSynth\utils\CN-border-La.gmt") as src:
         context = src.read()
         blocks = [cnt for cnt in context.split('>') if len(cnt) > 0]
         borders = [np.fromstring(block, dtype=float, sep=' ') for block in blocks]
@@ -254,7 +254,7 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
     cbar=plt.colorbar(cf,cax=fig.add_axes([0.13, 0.20, 0.75, 0.03]),format=formatter, orientation='horizontal',cmap=cmap1)
     cbar.ax.tick_params(labelsize=14)#条子的字号
 
-    clip=maskout.shp2clip(cf,ax, r"E:\D1\f01\data\province\china0.shp")
+    clip=maskout.shp2clip(cf,ax, r"E:\HydroSynth\utils\china0.shp")
     sub_ax = fig.add_axes([0.76, 0.29, 0.14, 0.155],projection=myproj)#小南海的位置
     sub_ax.add_feature(cfeature.LAND.with_scale('110m'))
     for line in borders:

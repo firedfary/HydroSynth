@@ -36,7 +36,7 @@ def _resolve_ckpt_path() -> str:
 
 
 def _load_weights(model: torch.nn.Module, device: torch.device) -> None:
-    ckpt_path = r"D:\workplace\conv_data\weight_t0\run_20260316_212117\epoch_200.pt"
+    ckpt_path = r"D:\workplace\conv_data\weight_t0\run_20260321_172941\epoch_130.pt"
     if not ckpt_path:
         print("No checkpoint specified; running inference with current model weights.")
         return
