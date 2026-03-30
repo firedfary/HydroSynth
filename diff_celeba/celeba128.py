@@ -51,10 +51,11 @@ def create_celeba_unet():
 
 # --- 1. 配置参数 ---
 class Config:
-    dataset_path = r"E:\D1\diffusion\my_models\data128" # 你的数据集路径
-    output_dir = 'E:/D1/diffusion/my_models/diff_test/weight/'      # 权重保存路径
+    dataset_path = r"E:\HydroSynth\datas\data128" # 你的数据集路径
+    output_dir = 'D:\workplace\diff_celeba\weight'      #
+    resume_from = "D:\\workplace\\diff_celeba\\weight\\checkpoint-4"
     image_size = 128
-    train_batch_size = 4  # T4 建议 16，若显存够可加到 32
+    train_batch_size = 16  # T4 建议 16，若显存够可加到 32
     eval_batch_size = 4    # 测试时生成的图片数量
     num_epochs = 50        # 根据需要调整
     gradient_accumulation_steps = 1
@@ -111,10 +112,26 @@ def train():
         model, optimizer, train_dataloader, lr_scheduler
     )
 
-    global_step = 0
+    # --- ???? checkpoint ?? ---
+    start_epoch = 0
+    if config.resume_from:
+        if os.path.isdir(config.resume_from):
+            accelerator.load_state(config.resume_from)
+            basename = os.path.basename(config.resume_from.rstrip('\\/'))
+            if basename.startswith('checkpoint-'):
+                try:
+                    start_epoch = int(basename.split('-')[-1]) + 1
+                except ValueError:
+                    start_epoch = 0
+            if accelerator.is_local_main_process:
+                print(f"Resumed from {config.resume_from}, start_epoch={start_epoch}")
+        else:
+            raise FileNotFoundError(f"resume_from not found: {config.resume_from}")
+
+    global_step = start_epoch * len(train_dataloader)
 
     # --- 3. 训练循环 ---
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         model.train()
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
@@ -183,7 +200,7 @@ def evaluate(config, epoch, model):
     combined_image = np.concatenate(rows, axis=1) 
     full_image = Image.fromarray(combined_image)
     
-    save_path = f"E:/D1/diffusion/my_models/diff_test/picture/epoch_{epoch}.png"
+    save_path = f"D:\workplace\diff_celeba\picture/epoch_{epoch}.png"
     full_image.save(save_path)
 
 if __name__ == "__main__":
