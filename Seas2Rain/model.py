@@ -89,6 +89,29 @@ class ConvLSTM(nn.Module):
         return out, new_state
 
 
+class SSTHistoryEncoder(nn.Module):
+    def __init__(self, in_channels: int = 1, hidden_dim: int = 8, num_layers: int = 1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.convlstm = ConvLSTM(input_dim=in_channels, hidden_dim=hidden_dim, num_layers=num_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, H, W] or [B, T, C, H, W]
+        if x.dim() == 4:
+            x = x.unsqueeze(2)
+        if x.dim() != 5:
+            raise ValueError(f"sst_hist must be [B,T,H,W] or [B,T,C,H,W], got {tuple(x.shape)}")
+        bsz, tdim, _, hdim, wdim = x.shape
+        state = self.convlstm.init_state(bsz, (hdim, wdim), x.device, x.dtype)
+        out = None
+        for t in range(tdim):
+            out, state = self.convlstm(x[:, t], state)
+        if out is None:
+            raise ValueError("sst_hist sequence is empty.")
+        return out
+
+
 class Seas2RainModel(nn.Module):
     def __init__(
         self,
@@ -98,6 +121,8 @@ class Seas2RainModel(nn.Module):
         encoder_channels: int = 64,
         decoder_channels: int = 32,
         ps_scale: int = 2,
+        sst_feat_channels: int = 8,
+        sst_num_layers: int = 1,
     ):
         super().__init__()
         if ps_scale != 2:
@@ -107,8 +132,15 @@ class Seas2RainModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.ps_scale = ps_scale
+        self.sst_feat_channels = sst_feat_channels
 
-        in_ch = cond_channels + 2  # cond + seas_anom + prev_pred
+        self.sst_encoder = SSTHistoryEncoder(
+            in_channels=1,
+            hidden_dim=sst_feat_channels,
+            num_layers=sst_num_layers,
+        )
+
+        in_ch = cond_channels + sst_feat_channels + 2  # cond + sst_feat + seas_anom + prev_pred
 
         self.encoder = nn.Sequential(
             nn.Conv2d(in_ch, encoder_channels, kernel_size=3, stride=2, padding=1),
@@ -134,6 +166,9 @@ class Seas2RainModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+    def encode_sst(self, sst_hist: torch.Tensor) -> torch.Tensor:
+        return self.sst_encoder(sst_hist)
+
     def init_state(
         self,
         batch_size: int,
@@ -149,6 +184,7 @@ class Seas2RainModel(nn.Module):
         seas_anom_t: torch.Tensor,
         ec_base_t: torch.Tensor,
         prev_pred: torch.Tensor,
+        sst_feat: Optional[torch.Tensor] = None,
         state: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         # cond_t: [B, 7, 60, 70]
@@ -159,9 +195,21 @@ class Seas2RainModel(nn.Module):
 
         target_hw = seas_anom_t.shape[-2:]
         if cond_t.shape[-2:] != target_hw:
-            cond_t = F.adaptive_avg_pool2d(cond_t, target_hw)#这里将cond_t的spatial维度从180*360缩放为60*70
+            cond_t = F.adaptive_avg_pool2d(cond_t, target_hw)
 
-        x = torch.cat([cond_t, seas_anom_t, prev_pred], dim=1)
+        if sst_feat is None:
+            sst_feat_t = cond_t.new_zeros((cond_t.shape[0], self.sst_feat_channels, target_hw[0], target_hw[1]))
+        else:
+            if sst_feat.dim() == 3:
+                sst_feat = sst_feat.unsqueeze(1)
+            if sst_feat.dim() != 4:
+                raise ValueError(f"sst_feat must be [B,C,H,W], got {tuple(sst_feat.shape)}")
+            if sst_feat.shape[-2:] != target_hw:
+                sst_feat_t = F.adaptive_avg_pool2d(sst_feat, target_hw)
+            else:
+                sst_feat_t = sst_feat
+
+        x = torch.cat([cond_t, sst_feat_t, seas_anom_t, prev_pred], dim=1)
         x = self.encoder(x)
         if state is None:
             h_out, w_out = x.shape[-2], x.shape[-1]
@@ -181,6 +229,7 @@ class Seas2RainModel(nn.Module):
         cond: torch.Tensor,
         seas_anom: torch.Tensor,
         ec_base: torch.Tensor,
+        sst_feat: Optional[torch.Tensor] = None,
         prev_pred: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # cond: [B, T, 7, 60, 70]
@@ -213,6 +262,7 @@ class Seas2RainModel(nn.Module):
                 seas_anom_t=seas_anom[:, t],
                 ec_base_t=ec_base[:, t],
                 prev_pred=prev_in,
+                sst_feat=sst_feat,
                 state=state,
             )
             preds.append(pred_t)

@@ -1,4 +1,5 @@
 ﻿import os
+import glob
 import random
 import re
 import sys
@@ -209,6 +210,122 @@ def read_modes_data(
     return tp_raw.astype(np.float32), cond_raw.astype(np.float32), init_dates, grid_lats, grid_lons
 
 
+def _parse_ersst_date(path: str) -> Optional[pd.Timestamp]:
+    name = os.path.basename(path)
+    match = re.search(r"(\d{6})", name)
+    if not match:
+        return None
+    yyyymm = match.group(1)
+    year = int(yyyymm[:4])
+    month = int(yyyymm[4:])
+    return pd.Timestamp(year=year, month=month, day=1)
+
+
+def read_ersst_data(
+    ersst_dir: str,
+    cache_path: str,
+) -> Tuple[np.ndarray, pd.DatetimeIndex]:
+    if os.path.exists(cache_path):
+        cached = np.load(cache_path, allow_pickle=True)
+        sst = cached["ssta"].astype(np.float32)
+        dates = pd.to_datetime(cached["dates"].astype(str))
+        return sst, pd.DatetimeIndex(dates)
+
+    files = sorted(glob.glob(os.path.join(ersst_dir, "ersst.v5.*.nc")))
+    if len(files) == 0:
+        raise FileNotFoundError(f"No ERSST files found under {ersst_dir}")
+
+    sst_list: List[np.ndarray] = []
+    date_list: List[pd.Timestamp] = []
+    ref_shape: Optional[Tuple[int, int]] = None
+
+    for f in tqdm.tqdm(files, desc="Read ERSST ssta"):
+        date = _parse_ersst_date(f)
+        if date is None:
+            continue
+        try:
+            with xr.open_dataset(f) as ds:
+                if "ssta" not in ds:
+                    raise KeyError("ssta not found in ERSST file")
+                arr = np.asarray(ds["ssta"].to_numpy())
+                if arr.ndim == 4:
+                    # Expected (time=1, zlev=1, lat, lon)
+                    if arr.shape[0] != 1 or arr.shape[1] != 1:
+                        raise ValueError(f"ssta shape not supported: {arr.shape}")
+                    arr = arr[0, 0]
+                elif arr.ndim == 3:
+                    # Expected (time=1, lat, lon)
+                    if arr.shape[0] != 1:
+                        raise ValueError(f"ssta shape not supported: {arr.shape}")
+                    arr = arr[0]
+                elif arr.ndim != 2:
+                    raise ValueError(f"ssta shape not supported: {arr.shape}")
+                if ref_shape is None:
+                    ref_shape = arr.shape
+                elif arr.shape != ref_shape:
+                    raise ValueError(f"Inconsistent ssta shape: {arr.shape} vs {ref_shape}")
+
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                sst_list.append(arr)
+                date_list.append(date)
+        except Exception as e:
+            print(f"Skip ERSST file {f}: {e}")
+            continue
+
+    if len(sst_list) == 0:
+        raise RuntimeError("No valid ERSST ssta data found.")
+
+    sst = np.stack(sst_list, axis=0)  # [T, H, W]
+    dates = pd.DatetimeIndex(date_list)
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        ssta=sst.astype(np.float32),
+        dates=np.array([d.strftime("%Y-%m-%d") for d in dates]),
+    )
+    return sst.astype(np.float32), dates
+
+
+def build_sst_history(
+    init_dates: pd.DatetimeIndex,
+    sst: np.ndarray,
+    sst_dates: pd.DatetimeIndex,
+    window: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    sst_index = {_month_start(d): i for i, d in enumerate(sst_dates)}
+    keep: List[int] = []
+    hist: List[np.ndarray] = []
+
+    for i, d in enumerate(init_dates):
+        seq: List[np.ndarray] = []
+        ok = True
+        for m in range(window, 0, -1):
+            md = _month_start(d - pd.DateOffset(months=m))
+            idx = sst_index.get(md, None)
+            if idx is None:
+                ok = False
+                break
+            seq.append(sst[idx])
+        if ok:
+            keep.append(i)
+            hist.append(np.stack(seq, axis=0))
+
+    if len(hist) == 0:
+        raise RuntimeError("No init_dates have complete SST history window.")
+
+    return np.stack(hist, axis=0).astype(np.float32), np.asarray(keep, dtype=np.int64)
+
+
+def normalize_sst_hist(sst_hist: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    train_vals = sst_hist[train_idx]
+    mean = float(train_vals.mean())
+    std = float(train_vals.std())
+    std = max(std, 1e-6)
+    sst_norm = (sst_hist - mean) / std
+    return sst_norm.astype(np.float32), mean, std
+
+
 def calc_precip_percent_anomaly(
     tp_tensor: torch.Tensor,
     init_dates: pd.DatetimeIndex,
@@ -402,6 +519,16 @@ def prepare_data() -> Dict[str, np.ndarray]:
     cond_raw = cond_raw[keep_mask]
     init_dates = pd.DatetimeIndex([d for d in init_dates if d in allowed])
 
+    ersst_dir = cfg.get("ersst_dir", r"D:\ersst_data")
+    sst_window = int(cfg.get("sst_window", 12))
+    ersst_cache = os.path.join(cache_dir, "ersst_ssta_cache.npz")
+    sst_raw, sst_dates = read_ersst_data(ersst_dir=ersst_dir, cache_path=ersst_cache)
+    sst_hist, keep_idx = build_sst_history(init_dates, sst_raw, sst_dates, sst_window)
+
+    tp_raw = tp_raw[keep_idx]
+    cond_raw = cond_raw[keep_idx]
+    init_dates = pd.DatetimeIndex([init_dates[i] for i in keep_idx])
+
     if len(init_dates) < 300:
         raise ValueError(f"Aligned sample count too small: {len(init_dates)}")
 
@@ -437,6 +564,28 @@ def prepare_data() -> Dict[str, np.ndarray]:
         cond_norm = normalize_cond(cond_raw, cond_mean, cond_std)
         np.save(cond_norm_cache, cond_norm)
 
+    sst_hist_cache = os.path.join(cache_dir, f"ersst_ssta_hist_w{sst_window}_n{len(init_dates)}.npz")
+    sst_mean = None
+    sst_std = None
+    if os.path.exists(sst_hist_cache):
+        cached = np.load(sst_hist_cache, allow_pickle=True)
+        cached_dates = cached["init_dates"] if "init_dates" in cached else None
+        if cached_dates is not None:
+            cached_dates = pd.to_datetime(cached_dates.astype(str))
+        if cached_dates is not None and len(cached_dates) == len(init_dates) and all(cached_dates == init_dates):
+            sst_hist = cached["sst_hist"].astype(np.float32)
+            sst_mean = float(cached["sst_mean"])
+            sst_std = float(cached["sst_std"])
+    if sst_mean is None or sst_std is None:
+        sst_hist, sst_mean, sst_std = normalize_sst_hist(sst_hist, splits["train"])
+        np.savez_compressed(
+            sst_hist_cache,
+            sst_hist=sst_hist.astype(np.float32),
+            sst_mean=np.array(sst_mean, dtype=np.float32),
+            sst_std=np.array(sst_std, dtype=np.float32),
+            init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
+        )
+
     obs_csv_path = cfg.get(
         "observe_csv_path",
         os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "utils", "observe_data24.csv")),
@@ -463,9 +612,12 @@ def prepare_data() -> Dict[str, np.ndarray]:
     obs_mask = obs_mask[:, :, None, :, :].astype(np.float32)
 
     data = {
-        "cond": cond_norm.astype(np.float32),  # 来自EC的条件场数据，已经过归一化处理，形状为[N, L, 7, H, W]
-        "seas_anom": seas_anom.astype(np.float32),  # 来自EC的降水异常数据，形状为[N, L, 1, H, W]
-        "ec_base": ec_base.astype(np.float32),  # 来自EC的降水异常数据，形状为[N, L, 1, H, W]
+        "cond": cond_norm.astype(np.float32),
+        "seas_anom": seas_anom.astype(np.float32),
+        "ec_base": ec_base.astype(np.float32),
+        "sst_hist": sst_hist.astype(np.float32),
+        "sst_mean": float(sst_mean),
+        "sst_std": float(sst_std),
         "obs_target": obs_target.astype(np.float32),
         "obs_mask": obs_mask.astype(np.float32),
         "init_dates": np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
@@ -479,12 +631,14 @@ def prepare_data() -> Dict[str, np.ndarray]:
 
 def validate_data_bundle(data: Dict[str, np.ndarray]) -> None:
     n = len(data["init_dates"])
-    for k in ("cond", "seas_anom", "ec_base", "obs_target", "obs_mask"):
+    for k in ("cond", "seas_anom", "ec_base", "sst_hist", "obs_target", "obs_mask"):
         if data[k].shape[0] != n:
             raise ValueError(f"{k} length mismatch: {data[k].shape[0]} vs {n}")
 
     if data["cond"].ndim != 5 or data["cond"].shape[1] != LEADS or data["cond"].shape[2] != len(COND_VARS):
         raise ValueError(f"cond shape invalid: {data['cond'].shape}")
+    if data["sst_hist"].ndim != 4:
+        raise ValueError(f"sst_hist shape invalid: {data['sst_hist'].shape}")
     if tuple(data["seas_anom"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
         raise ValueError(f"seas_anom shape invalid: {data['seas_anom'].shape}")
     if tuple(data["ec_base"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
@@ -500,6 +654,7 @@ class Seas2RainDataset(Dataset):
         self.cond = data["cond"]
         self.seas_anom = data["seas_anom"]
         self.ec_base = data["ec_base"]
+        self.sst_hist = data["sst_hist"]
         self.obs_target = data["obs_target"]
         self.obs_mask = data["obs_mask"]
         self.indices = np.asarray(indices, dtype=np.int64)
@@ -512,9 +667,10 @@ class Seas2RainDataset(Dataset):
         cond = torch.from_numpy(self.cond[idx])
         seas_anom = torch.from_numpy(self.seas_anom[idx])
         ec_base = torch.from_numpy(self.ec_base[idx])
+        sst_hist = torch.from_numpy(self.sst_hist[idx])
         obs_target = torch.from_numpy(self.obs_target[idx])
         obs_mask = torch.from_numpy(self.obs_mask[idx])
-        return cond, seas_anom, ec_base, obs_target, obs_mask
+        return cond, seas_anom, ec_base, obs_target, obs_mask, sst_hist
 
 
 def build_dataloaders(data: Dict[str, np.ndarray], device: torch.device):
@@ -560,6 +716,8 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
     decoder_channels = int(cfg.get("seas2rain_decoder_channels", 32))
     encoder_channels = int(cfg.get("seas2rain_encoder_channels", 64))
     ps_scale = int(cfg.get("seas2rain_ps_scale", 2))
+    sst_feat_channels = int(cfg.get("sst_feat_channels", 8))
+    sst_num_layers = int(cfg.get("sst_num_layers", 1))
 
     net = model.Seas2RainModel(
         cond_channels=len(COND_VARS),
@@ -568,6 +726,8 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
         encoder_channels=encoder_channels,
         decoder_channels=decoder_channels,
         ps_scale=ps_scale,
+        sst_feat_channels=sst_feat_channels,
+        sst_num_layers=sst_num_layers,
     ).to(device)
     return net
 
@@ -597,6 +757,7 @@ def autoregressive_rollout(
     cond: torch.Tensor,
     seas_anom: torch.Tensor,
     ec_base: torch.Tensor,
+    sst_feat: Optional[torch.Tensor],
     target: Optional[torch.Tensor],
     teacher_forcing_ratio: float,
     detach_rollout: bool,
@@ -623,6 +784,7 @@ def autoregressive_rollout(
             seas_anom_t=seas_anom[:, t],
             ec_base_t=ec_base[:, t],
             prev_pred=prev_in,
+            sst_feat=sst_feat,
             state=state,
         )
         preds.append(pred_t)
@@ -722,7 +884,7 @@ def finalize_metrics(state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
 def evaluate_baseline(loader: DataLoader, device: torch.device) -> Dict[str, np.ndarray]:
     state = init_metric_state()
     with torch.no_grad():
-        for _, _, ec_base, target, obs_mask in loader:
+        for _, _, ec_base, target, obs_mask, _ in loader:
             ec_base = ec_base.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             obs_mask = obs_mask.to(device, non_blocking=True)
@@ -796,12 +958,14 @@ def train() -> None:
         teacher_forcing_ratio = _ssr_ratio(epoch, ssr_start, ssr_end, ssr_decay_epochs) if autoregressive else 0.0
 
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}")
-        for cond, seas_anom, ec_base, target, obs_mask in pbar:
+        for cond, seas_anom, ec_base, target, obs_mask, sst_hist in pbar:
             cond = cond.to(device, non_blocking=True)
             seas_anom = seas_anom.to(device, non_blocking=True)
             ec_base = ec_base.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             obs_mask = obs_mask.to(device, non_blocking=True)
+            sst_hist = sst_hist.to(device, non_blocking=True)
+            sst_feat = net.encode_sst(sst_hist)
 
             if autoregressive:
                 pred = autoregressive_rollout(
@@ -809,13 +973,14 @@ def train() -> None:
                     cond=cond,
                     seas_anom=seas_anom,
                     ec_base=ec_base,
+                    sst_feat=sst_feat,
                     target=target,
                     teacher_forcing_ratio=teacher_forcing_ratio,
                     detach_rollout=detach_rollout,
                     prev_pred_init=prev_pred_init,
                 )
             else:
-                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base)
+                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
 
             mask2 = obs_mask[:, :, 0] > 0.5
             loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2)
@@ -845,12 +1010,14 @@ def train() -> None:
         val_losses: List[float] = []
         val_state = init_metric_state()
         with torch.no_grad():
-            for cond, seas_anom, ec_base, target, obs_mask in val_loader:
+            for cond, seas_anom, ec_base, target, obs_mask, sst_hist in val_loader:
                 cond = cond.to(device, non_blocking=True)
                 seas_anom = seas_anom.to(device, non_blocking=True)
                 ec_base = ec_base.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 obs_mask = obs_mask.to(device, non_blocking=True)
+                sst_hist = sst_hist.to(device, non_blocking=True)
+                sst_feat = net.encode_sst(sst_hist)
 
                 if autoregressive:
                     pred = autoregressive_rollout(
@@ -858,13 +1025,14 @@ def train() -> None:
                         cond=cond,
                         seas_anom=seas_anom,
                         ec_base=ec_base,
+                        sst_feat=sst_feat,
                         target=None,
                         teacher_forcing_ratio=0.0,
                         detach_rollout=True,
                         prev_pred_init=prev_pred_init,
                     )
                 else:
-                    pred = net(cond, seas_anom=seas_anom, ec_base=ec_base)
+                    pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
 
                 mask2 = obs_mask[:, :, 0] > 0.5
                 loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2)
@@ -932,12 +1100,14 @@ def train() -> None:
     test_losses: List[float] = []
     test_state = init_metric_state()
     with torch.no_grad():
-        for cond, seas_anom, ec_base, target, obs_mask in test_loader:
+        for cond, seas_anom, ec_base, target, obs_mask, sst_hist in test_loader:
             cond = cond.to(device, non_blocking=True)
             seas_anom = seas_anom.to(device, non_blocking=True)
             ec_base = ec_base.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             obs_mask = obs_mask.to(device, non_blocking=True)
+            sst_hist = sst_hist.to(device, non_blocking=True)
+            sst_feat = net.encode_sst(sst_hist)
 
             if autoregressive:
                 pred = autoregressive_rollout(
@@ -945,13 +1115,14 @@ def train() -> None:
                     cond=cond,
                     seas_anom=seas_anom,
                     ec_base=ec_base,
+                    sst_feat=sst_feat,
                     target=None,
                     teacher_forcing_ratio=0.0,
                     detach_rollout=True,
                     prev_pred_init=prev_pred_init,
                 )
             else:
-                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base)
+                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
 
             mask2 = obs_mask[:, :, 0] > 0.5
             loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2)
