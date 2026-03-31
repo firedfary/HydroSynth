@@ -326,6 +326,76 @@ def normalize_sst_hist(sst_hist: np.ndarray, train_idx: np.ndarray) -> Tuple[np.
     return sst_norm.astype(np.float32), mean, std
 
 
+def compute_eof_basis(x: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute EOF basis from samples x: [N, F]. Returns (mean[F], basis[k, F])."""
+    x = np.asarray(x, dtype=np.float64)
+    n_samples, n_features = x.shape
+    if k > min(n_samples, n_features):
+        raise ValueError(f"EOF k={k} exceeds min(n_samples, n_features)={min(n_samples, n_features)}")
+    mean = x.mean(axis=0)
+    x_centered = x - mean
+    _, _, vt = np.linalg.svd(x_centered, full_matrices=False)
+    basis = vt[:k].astype(np.float32)
+    return mean.astype(np.float32), basis
+
+
+def project_pcs(x: np.ndarray, mean: np.ndarray, basis: np.ndarray, block_size: int = 2048) -> np.ndarray:
+    """Project samples x: [N, F] to PC scores using mean[F] and basis[k, F]."""
+    x = np.asarray(x, dtype=np.float32)
+    mean = mean.astype(np.float32)
+    basis_t = basis.astype(np.float32).T
+    out = np.empty((x.shape[0], basis.shape[0]), dtype=np.float32)
+    for i in range(0, x.shape[0], block_size):
+        xi = x[i : i + block_size] - mean
+        out[i : i + block_size] = xi @ basis_t
+    return out
+
+
+def compute_cond_pcs(
+    cond_norm: np.ndarray,
+    train_idx: np.ndarray,
+    pc_k: int,
+    block_size: int = 2048,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-variable EOF/PCs for cond.
+    Returns (cond_pcs [N,L,V,K], cond_pc_mean [V,F], cond_pc_basis [V,K,F])."""
+    n, l, v, h, w = cond_norm.shape
+    f = h * w
+    cond_pcs = np.zeros((n, l, v, pc_k), dtype=np.float32)
+    cond_pc_mean = np.zeros((v, f), dtype=np.float32)
+    cond_pc_basis = np.zeros((v, pc_k, f), dtype=np.float32)
+
+    for vi in range(v):
+        x_train = cond_norm[train_idx, :, vi].reshape(-1, f)
+        mean, basis = compute_eof_basis(x_train, pc_k)
+        cond_pc_mean[vi] = mean
+        cond_pc_basis[vi] = basis
+
+        x_all = cond_norm[:, :, vi].reshape(-1, f)
+        pcs = project_pcs(x_all, mean, basis, block_size=block_size)
+        cond_pcs[:, :, vi] = pcs.reshape(n, l, pc_k)
+
+    return cond_pcs, cond_pc_mean, cond_pc_basis
+
+
+def compute_sst_pcs(
+    sst_hist: np.ndarray,
+    train_idx: np.ndarray,
+    pc_k: int,
+    block_size: int = 2048,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute EOF/PCs for SST history.
+    Returns (sst_pcs [N,T,K], sst_pc_mean [F], sst_pc_basis [K,F])."""
+    n, t, h, w = sst_hist.shape
+    f = h * w
+    x_train = sst_hist[train_idx].reshape(-1, f)
+    mean, basis = compute_eof_basis(x_train, pc_k)
+    x_all = sst_hist.reshape(-1, f)
+    pcs = project_pcs(x_all, mean, basis, block_size=block_size)
+    sst_pcs = pcs.reshape(n, t, pc_k)
+    return sst_pcs, mean, basis
+
+
 def calc_precip_percent_anomaly(
     tp_tensor: torch.Tensor,
     init_dates: pd.DatetimeIndex,
@@ -586,6 +656,53 @@ def prepare_data() -> Dict[str, np.ndarray]:
             init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
         )
 
+    cond_pc_k = int(cfg.get("cond_pc_k", 8))
+    sst_pc_k = int(cfg.get("sst_pc_k", 8))
+
+    cond_pcs_cache = os.path.join(cache_dir, f"cond_pcs_k{cond_pc_k}_n{len(init_dates)}.npz")
+    cond_pcs = None
+    if os.path.exists(cond_pcs_cache):
+        cached = np.load(cond_pcs_cache, allow_pickle=True)
+        cached_dates = cached["init_dates"] if "init_dates" in cached else None
+        if cached_dates is not None:
+            cached_dates = pd.to_datetime(cached_dates.astype(str))
+        if cached_dates is not None and len(cached_dates) == len(init_dates) and all(cached_dates == init_dates):
+            cond_pcs = cached["cond_pcs"].astype(np.float32)
+            if cond_pcs.shape[:3] != (len(init_dates), LEADS, len(COND_VARS)) or cond_pcs.shape[3] != cond_pc_k:
+                cond_pcs = None
+
+    if cond_pcs is None:
+        cond_pcs, cond_pc_mean, cond_pc_basis = compute_cond_pcs(cond_norm, splits["train"], cond_pc_k)
+        np.savez_compressed(
+            cond_pcs_cache,
+            cond_pcs=cond_pcs.astype(np.float32),
+            cond_pc_mean=cond_pc_mean.astype(np.float32),
+            cond_pc_basis=cond_pc_basis.astype(np.float32),
+            init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
+        )
+
+    sst_pcs_cache = os.path.join(cache_dir, f"sst_pcs_k{sst_pc_k}_n{len(init_dates)}.npz")
+    sst_pcs = None
+    if os.path.exists(sst_pcs_cache):
+        cached = np.load(sst_pcs_cache, allow_pickle=True)
+        cached_dates = cached["init_dates"] if "init_dates" in cached else None
+        if cached_dates is not None:
+            cached_dates = pd.to_datetime(cached_dates.astype(str))
+        if cached_dates is not None and len(cached_dates) == len(init_dates) and all(cached_dates == init_dates):
+            sst_pcs = cached["sst_pcs"].astype(np.float32)
+            if sst_pcs.shape[:2] != (len(init_dates), sst_window) or sst_pcs.shape[2] != sst_pc_k:
+                sst_pcs = None
+
+    if sst_pcs is None:
+        sst_pcs, sst_pc_mean, sst_pc_basis = compute_sst_pcs(sst_hist, splits["train"], sst_pc_k)
+        np.savez_compressed(
+            sst_pcs_cache,
+            sst_pcs=sst_pcs.astype(np.float32),
+            sst_pc_mean=sst_pc_mean.astype(np.float32),
+            sst_pc_basis=sst_pc_basis.astype(np.float32),
+            init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
+        )
+
     obs_csv_path = cfg.get(
         "observe_csv_path",
         os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "utils", "observe_data24.csv")),
@@ -612,10 +729,10 @@ def prepare_data() -> Dict[str, np.ndarray]:
     obs_mask = obs_mask[:, :, None, :, :].astype(np.float32)
 
     data = {
-        "cond": cond_norm.astype(np.float32),
+        "cond_pcs": cond_pcs.astype(np.float32),
         "seas_anom": seas_anom.astype(np.float32),
         "ec_base": ec_base.astype(np.float32),
-        "sst_hist": sst_hist.astype(np.float32),
+        "sst_pcs": sst_pcs.astype(np.float32),
         "sst_mean": float(sst_mean),
         "sst_std": float(sst_std),
         "obs_target": obs_target.astype(np.float32),
@@ -631,14 +748,15 @@ def prepare_data() -> Dict[str, np.ndarray]:
 
 def validate_data_bundle(data: Dict[str, np.ndarray]) -> None:
     n = len(data["init_dates"])
-    for k in ("cond", "seas_anom", "ec_base", "sst_hist", "obs_target", "obs_mask"):
+    for k in ("cond_pcs", "seas_anom", "ec_base", "sst_pcs", "obs_target", "obs_mask"):
         if data[k].shape[0] != n:
             raise ValueError(f"{k} length mismatch: {data[k].shape[0]} vs {n}")
 
-    if data["cond"].ndim != 5 or data["cond"].shape[1] != LEADS or data["cond"].shape[2] != len(COND_VARS):
-        raise ValueError(f"cond shape invalid: {data['cond'].shape}")
-    if data["sst_hist"].ndim != 4:
-        raise ValueError(f"sst_hist shape invalid: {data['sst_hist'].shape}")
+    if data["cond_pcs"].ndim != 4 or data["cond_pcs"].shape[1] != LEADS or data["cond_pcs"].shape[2] != len(COND_VARS):
+        raise ValueError(f"cond_pcs shape invalid: {data['cond_pcs'].shape}")
+    sst_window = int(config.modelconfig.get("sst_window", 12))
+    if data["sst_pcs"].ndim != 3 or data["sst_pcs"].shape[1] != sst_window:
+        raise ValueError(f"sst_pcs shape invalid: {data['sst_pcs'].shape}")
     if tuple(data["seas_anom"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
         raise ValueError(f"seas_anom shape invalid: {data['seas_anom'].shape}")
     if tuple(data["ec_base"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
@@ -651,10 +769,10 @@ def validate_data_bundle(data: Dict[str, np.ndarray]) -> None:
 
 class Seas2RainDataset(Dataset):
     def __init__(self, data: Dict[str, np.ndarray], indices: np.ndarray):
-        self.cond = data["cond"]
+        self.cond_pcs = data["cond_pcs"]
         self.seas_anom = data["seas_anom"]
         self.ec_base = data["ec_base"]
-        self.sst_hist = data["sst_hist"]
+        self.sst_pcs = data["sst_pcs"]
         self.obs_target = data["obs_target"]
         self.obs_mask = data["obs_mask"]
         self.indices = np.asarray(indices, dtype=np.int64)
@@ -664,13 +782,13 @@ class Seas2RainDataset(Dataset):
 
     def __getitem__(self, i: int):
         idx = int(self.indices[i])
-        cond = torch.from_numpy(self.cond[idx])
+        cond_pcs = torch.from_numpy(self.cond_pcs[idx])
         seas_anom = torch.from_numpy(self.seas_anom[idx])
         ec_base = torch.from_numpy(self.ec_base[idx])
-        sst_hist = torch.from_numpy(self.sst_hist[idx])
+        sst_pcs = torch.from_numpy(self.sst_pcs[idx])
         obs_target = torch.from_numpy(self.obs_target[idx])
         obs_mask = torch.from_numpy(self.obs_mask[idx])
-        return cond, seas_anom, ec_base, obs_target, obs_mask, sst_hist
+        return cond_pcs, seas_anom, ec_base, obs_target, obs_mask, sst_pcs
 
 
 def build_dataloaders(data: Dict[str, np.ndarray], device: torch.device):
@@ -716,18 +834,20 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
     decoder_channels = int(cfg.get("seas2rain_decoder_channels", 32))
     encoder_channels = int(cfg.get("seas2rain_encoder_channels", 64))
     ps_scale = int(cfg.get("seas2rain_ps_scale", 2))
-    sst_feat_channels = int(cfg.get("sst_feat_channels", 8))
-    sst_num_layers = int(cfg.get("sst_num_layers", 1))
+    cond_pc_k = int(cfg.get("cond_pc_k", 8))
+    sst_pc_k = int(cfg.get("sst_pc_k", 8))
+    sst_pc_hidden = int(cfg.get("sst_pc_hidden", 16))
 
     net = model.Seas2RainModel(
         cond_channels=len(COND_VARS),
+        cond_pc_k=cond_pc_k,
+        sst_pc_k=sst_pc_k,
+        sst_pc_hidden=sst_pc_hidden,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         encoder_channels=encoder_channels,
         decoder_channels=decoder_channels,
         ps_scale=ps_scale,
-        sst_feat_channels=sst_feat_channels,
-        sst_num_layers=sst_num_layers,
     ).to(device)
     return net
 
@@ -754,17 +874,17 @@ def _init_prev_pred(ec_base: torch.Tensor, seas_anom: torch.Tensor, mode: str) -
 
 def autoregressive_rollout(
     net: model.Seas2RainModel,
-    cond: torch.Tensor,
+    cond_pcs: torch.Tensor,
     seas_anom: torch.Tensor,
     ec_base: torch.Tensor,
-    sst_feat: Optional[torch.Tensor],
+    sst_vec: Optional[torch.Tensor],
     target: Optional[torch.Tensor],
     teacher_forcing_ratio: float,
     detach_rollout: bool,
     prev_pred_init: str,
 ) -> torch.Tensor:
-    # cond: [B, T, 7, 60, 70]
-    bsz, tdim = cond.shape[0], cond.shape[1]
+    # cond_pcs: [B, T, V, K]
+    bsz, tdim = cond_pcs.shape[0], cond_pcs.shape[1]
     prev_pred = _init_prev_pred(ec_base, seas_anom, prev_pred_init)
     preds: List[torch.Tensor] = []
 
@@ -774,17 +894,17 @@ def autoregressive_rollout(
             prev_in = prev_pred
         else:
             if target is not None and teacher_forcing_ratio > 0.0:
-                use_teacher = torch.rand(bsz, device=cond.device) < teacher_forcing_ratio
+                use_teacher = torch.rand(bsz, device=cond_pcs.device) < teacher_forcing_ratio
                 prev_in = torch.where(use_teacher[:, None, None], target[:, t - 1, 0], prev_pred)
             else:
                 prev_in = prev_pred
 
         pred_t, state = net.forward_step(
-            cond_t=cond[:, t],
+            cond_pcs_t=cond_pcs[:, t],
             seas_anom_t=seas_anom[:, t],
             ec_base_t=ec_base[:, t],
             prev_pred=prev_in,
-            sst_feat=sst_feat,
+            sst_vec=sst_vec,
             state=state,
         )
         preds.append(pred_t)
@@ -969,29 +1089,29 @@ def train() -> None:
         teacher_forcing_ratio = _ssr_ratio(epoch, ssr_start, ssr_end, ssr_decay_epochs) if autoregressive else 0.0
 
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}")
-        for cond, seas_anom, ec_base, target, obs_mask, sst_hist in pbar:
-            cond = cond.to(device, non_blocking=True)
+        for cond_pcs, seas_anom, ec_base, target, obs_mask, sst_pcs in pbar:
+            cond_pcs = cond_pcs.to(device, non_blocking=True)
             seas_anom = seas_anom.to(device, non_blocking=True)
             ec_base = ec_base.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             obs_mask = obs_mask.to(device, non_blocking=True)
-            sst_hist = sst_hist.to(device, non_blocking=True)
-            sst_feat = net.encode_sst(sst_hist)
+            sst_pcs = sst_pcs.to(device, non_blocking=True)
+            sst_vec = net.encode_sst_pcs(sst_pcs)
 
             if autoregressive:
                 pred = autoregressive_rollout(
                     net=net,
-                    cond=cond,
+                    cond_pcs=cond_pcs,
                     seas_anom=seas_anom,
                     ec_base=ec_base,
-                    sst_feat=sst_feat,
+                    sst_vec=sst_vec,
                     target=target,
                     teacher_forcing_ratio=teacher_forcing_ratio,
                     detach_rollout=detach_rollout,
                     prev_pred_init=prev_pred_init,
                 )
             else:
-                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
+                pred = net(cond_pcs, seas_anom=seas_anom, ec_base=ec_base, sst_vec=sst_vec)
 
             mask2 = obs_mask[:, :, 0] > 0.5
             loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
@@ -1021,29 +1141,29 @@ def train() -> None:
         val_losses: List[float] = []
         val_state = init_metric_state()
         with torch.no_grad():
-            for cond, seas_anom, ec_base, target, obs_mask, sst_hist in val_loader:
-                cond = cond.to(device, non_blocking=True)
+            for cond_pcs, seas_anom, ec_base, target, obs_mask, sst_pcs in val_loader:
+                cond_pcs = cond_pcs.to(device, non_blocking=True)
                 seas_anom = seas_anom.to(device, non_blocking=True)
                 ec_base = ec_base.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 obs_mask = obs_mask.to(device, non_blocking=True)
-                sst_hist = sst_hist.to(device, non_blocking=True)
-                sst_feat = net.encode_sst(sst_hist)
+                sst_pcs = sst_pcs.to(device, non_blocking=True)
+                sst_vec = net.encode_sst_pcs(sst_pcs)
 
                 if autoregressive:
                     pred = autoregressive_rollout(
                         net=net,
-                        cond=cond,
+                        cond_pcs=cond_pcs,
                         seas_anom=seas_anom,
                         ec_base=ec_base,
-                        sst_feat=sst_feat,
+                        sst_vec=sst_vec,
                         target=None,
                         teacher_forcing_ratio=0.0,
                         detach_rollout=True,
                         prev_pred_init=prev_pred_init,
                     )
                 else:
-                    pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
+                    pred = net(cond_pcs, seas_anom=seas_anom, ec_base=ec_base, sst_vec=sst_vec)
 
                 mask2 = obs_mask[:, :, 0] > 0.5
                 loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
@@ -1111,29 +1231,29 @@ def train() -> None:
     test_losses: List[float] = []
     test_state = init_metric_state()
     with torch.no_grad():
-        for cond, seas_anom, ec_base, target, obs_mask, sst_hist in test_loader:
-            cond = cond.to(device, non_blocking=True)
+        for cond_pcs, seas_anom, ec_base, target, obs_mask, sst_pcs in test_loader:
+            cond_pcs = cond_pcs.to(device, non_blocking=True)
             seas_anom = seas_anom.to(device, non_blocking=True)
             ec_base = ec_base.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             obs_mask = obs_mask.to(device, non_blocking=True)
-            sst_hist = sst_hist.to(device, non_blocking=True)
-            sst_feat = net.encode_sst(sst_hist)
+            sst_pcs = sst_pcs.to(device, non_blocking=True)
+            sst_vec = net.encode_sst_pcs(sst_pcs)
 
             if autoregressive:
                 pred = autoregressive_rollout(
                     net=net,
-                    cond=cond,
+                    cond_pcs=cond_pcs,
                     seas_anom=seas_anom,
                     ec_base=ec_base,
-                    sst_feat=sst_feat,
+                    sst_vec=sst_vec,
                     target=None,
                     teacher_forcing_ratio=0.0,
                     detach_rollout=True,
                     prev_pred_init=prev_pred_init,
                 )
             else:
-                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
+                pred = net(cond_pcs, seas_anom=seas_anom, ec_base=ec_base, sst_vec=sst_vec)
 
             mask2 = obs_mask[:, :, 0] > 0.5
             loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
