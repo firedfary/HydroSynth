@@ -797,6 +797,7 @@ def differentiable_acc_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    rmse_weight: float = 0.0,
     epsilon: float = 1e-8,
 ) -> Tuple[torch.Tensor, int]:
     # pred/target: [B, T, H, W], mask: [B, T, H, W] bool
@@ -817,7 +818,16 @@ def differentiable_acc_loss(
 
     acc = cov / (pred_std * target_std + epsilon)
     acc = torch.where(valid.squeeze(-1).squeeze(-1), acc, torch.zeros_like(acc))
-    loss = 1.0 - acc.mean()
+    acc_loss = 1.0 - acc.mean()
+
+    if rmse_weight > 0.0:
+        mse = ((pred - target) ** 2 * m).sum(dim=(2, 3), keepdim=True) / count
+        rmse = torch.sqrt(mse + epsilon)
+        rmse = torch.where(valid, rmse, torch.zeros_like(rmse))
+        rmse_loss = rmse.mean()
+        loss = acc_loss + rmse_weight * rmse_loss
+    else:
+        loss = acc_loss
     valid_count = int(valid.sum().item())
     return loss, valid_count
 
@@ -923,6 +933,7 @@ def train() -> None:
     ssr_decay_epochs = int(config.modelconfig.get("ssr_decay_epochs", 30))
     prev_pred_init = str(config.modelconfig.get("prev_pred_init", "ec_base"))
     detach_rollout = bool(config.modelconfig.get("detach_rollout", False))
+    rmse_weight = float(config.modelconfig.get("rmse_weight", 0.1))
 
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
     writer = SummaryWriter(log_dir=config.modelconfig["log_path"])
@@ -983,7 +994,7 @@ def train() -> None:
                 pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
 
             mask2 = obs_mask[:, :, 0] > 0.5
-            loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2)
+            loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
 
             if valid_count == 0:
                 skipped_batches += 1
@@ -1035,7 +1046,7 @@ def train() -> None:
                     pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
 
                 mask2 = obs_mask[:, :, 0] > 0.5
-                loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2)
+                loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
                 if valid_count == 0:
                     continue
                 val_losses.append(float(loss.item()))
@@ -1125,7 +1136,7 @@ def train() -> None:
                 pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_feat=sst_feat)
 
             mask2 = obs_mask[:, :, 0] > 0.5
-            loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2)
+            loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
             if valid_count == 0:
                 continue
             test_losses.append(float(loss.item()))
