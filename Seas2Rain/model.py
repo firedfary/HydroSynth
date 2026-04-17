@@ -7,13 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _num_groups(channels: int) -> int:
-    for groups in (8, 4, 2, 1):
-        if channels % groups == 0:
-            return groups
-    return 1
-
-
 class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, kernel_size: int = 3):
         super().__init__()
@@ -89,96 +82,81 @@ class ConvLSTM(nn.Module):
         return out, new_state
 
 
-class SSTPCEncoder(nn.Module):
-    def __init__(self, pc_dim: int, hidden_dim: int, num_layers: int = 1):
+class SPADE(nn.Module):
+    def __init__(self, cond_channels: int, out_channels: int, hidden_channels: int = 16, cond_dropout: float = 0.0):
         super().__init__()
-        self.gru = nn.GRU(
-            input_size=pc_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.0 if num_layers <= 1 else 0.1,
-        )
-        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.bn = nn.BatchNorm2d(out_channels, affine=False)
+        self.cond_drop = nn.Dropout2d(cond_dropout) if cond_dropout > 0.0 else nn.Identity()
+        self.conv_shared = nn.Conv2d(cond_channels, hidden_channels, kernel_size=3, padding=1)
+        self.conv_gamma = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1)
+        self.conv_beta = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1)
+        self._zero_init()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, K]
-        if x.dim() != 3:
-            raise ValueError(f"sst_pcs must be [B,T,K], got {tuple(x.shape)}")
-        _, h = self.gru(x)
-        vec = h[-1]
-        vec = self.out_norm(vec)
-        return vec
+    def _zero_init(self) -> None:
+        nn.init.zeros_(self.conv_gamma.weight)
+        nn.init.zeros_(self.conv_gamma.bias)
+        nn.init.zeros_(self.conv_beta.weight)
+        nn.init.zeros_(self.conv_beta.bias)
 
-
-class FiLM(nn.Module):
-    def __init__(self, cond_dim: int, num_features: int, hidden_dim: Optional[int] = None):
-        super().__init__()
-        if hidden_dim is None:
-            self.net = nn.Linear(cond_dim, 2 * num_features)
-        else:
-            self.net = nn.Sequential(
-                nn.Linear(cond_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, 2 * num_features),
-            )
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        params = self.net(cond)
-        gamma, beta = params.chunk(2, dim=-1)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)
-        return x * (1.0 + gamma) + beta
+    def forward(self, x: torch.Tensor, cond_map: torch.Tensor) -> torch.Tensor:
+        if cond_map.shape[-2:] != x.shape[-2:]:
+            cond_map = F.adaptive_avg_pool2d(cond_map, x.shape[-2:])
+        cond_map = self.cond_drop(cond_map)
+        h = self.conv_shared(cond_map)
+        gamma = self.conv_gamma(h)
+        beta = self.conv_beta(h)
+        return self.bn(x) * (1.0 + gamma) + beta
 
 
 class Seas2RainModel(nn.Module):
     def __init__(
         self,
         cond_channels: int = 7,
-        cond_pc_k: int = 8,
-        sst_pc_k: int = 8,
-        sst_pc_hidden: int = 16,
+        sst_hist_channels: int = 12,
+        spade_hidden: int = 16,
+        dropout: float = 0.1,
+        cond_dropout: float = 0.1,
         hidden_dim: int = 64,
         num_layers: int = 1,
         encoder_channels: int = 64,
         decoder_channels: int = 32,
         ps_scale: int = 2,
-        sst_gru_layers: int = 1,
     ):
         super().__init__()
         if ps_scale != 2:
             raise ValueError("Only PixelShuffle scale=2 is supported for 60x70 output.")
 
         self.cond_channels = cond_channels
-        self.cond_pc_k = cond_pc_k
-        self.sst_pc_k = sst_pc_k
-        self.sst_pc_hidden = sst_pc_hidden
+        self.sst_hist_channels = sst_hist_channels
+        self.spade_hidden = spade_hidden
+        self.dropout = dropout
+        self.cond_dropout = cond_dropout
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.ps_scale = ps_scale
 
-        cond_vec_dim = cond_channels * cond_pc_k + sst_pc_hidden
-
-        self.sst_encoder = SSTPCEncoder(pc_dim=sst_pc_k, hidden_dim=sst_pc_hidden, num_layers=sst_gru_layers)
+        cond_in_ch = cond_channels + sst_hist_channels
 
         in_ch = 2  # seas_anom + prev_pred
 
         self.enc_conv1 = nn.Conv2d(in_ch, encoder_channels, kernel_size=3, stride=2, padding=1)
-        self.enc_norm1 = nn.GroupNorm(_num_groups(encoder_channels), encoder_channels)
-        self.enc_film1 = FiLM(cond_vec_dim, encoder_channels)
+        self.enc_spade1 = SPADE(cond_in_ch, encoder_channels, hidden_channels=spade_hidden, cond_dropout=cond_dropout)
+        self.enc_drop1 = nn.Dropout2d(dropout)
 
         self.enc_conv2 = nn.Conv2d(encoder_channels, hidden_dim, kernel_size=3, padding=1)
-        self.enc_norm2 = nn.GroupNorm(_num_groups(hidden_dim), hidden_dim)
-        self.enc_film2 = FiLM(cond_vec_dim, hidden_dim)
+        self.enc_spade2 = SPADE(cond_in_ch, hidden_dim, hidden_channels=spade_hidden, cond_dropout=cond_dropout)
+        self.enc_drop2 = nn.Dropout2d(dropout)
 
         self.convlstm = ConvLSTM(input_dim=hidden_dim, hidden_dim=hidden_dim, num_layers=num_layers)
 
         self.up_conv = nn.Conv2d(hidden_dim, decoder_channels * (ps_scale ** 2), kernel_size=3, padding=1)
         self.pixel_shuffle = nn.PixelShuffle(ps_scale)
-        self.dec_film = FiLM(cond_vec_dim, decoder_channels)
+        self.dec_spade = SPADE(cond_in_ch, decoder_channels, hidden_channels=spade_hidden, cond_dropout=cond_dropout)
+        self.dec_drop = nn.Dropout2d(dropout)
         self.out_conv = nn.Conv2d(decoder_channels, 1, kernel_size=3, padding=1)
 
         self._init_weights()
+        self._zero_spade()
 
     def _init_weights(self) -> None:
         for module in self.modules():
@@ -187,8 +165,10 @@ class Seas2RainModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def encode_sst_pcs(self, sst_pcs: torch.Tensor) -> torch.Tensor:
-        return self.sst_encoder(sst_pcs)
+    def _zero_spade(self) -> None:
+        for module in self.modules():
+            if isinstance(module, SPADE):
+                module._zero_init()
 
     def init_state(
         self,
@@ -199,51 +179,55 @@ class Seas2RainModel(nn.Module):
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         return self.convlstm.init_state(batch_size=batch_size, spatial=spatial, device=device, dtype=dtype)
 
-    def _build_cond_vec(self, cond_pcs_t: torch.Tensor, sst_vec: Optional[torch.Tensor]) -> torch.Tensor:
-        if cond_pcs_t.dim() == 3:
-            cond_flat = cond_pcs_t.reshape(cond_pcs_t.shape[0], -1)
-        elif cond_pcs_t.dim() == 2:
-            cond_flat = cond_pcs_t
-        else:
-            raise ValueError(f"cond_pcs_t must be [B,V,K] or [B,V*K], got {tuple(cond_pcs_t.shape)}")
+    def _build_cond_map(
+        self,
+        cond_t: torch.Tensor,
+        sst_hist: torch.Tensor,
+        target_hw: Tuple[int, int],
+    ) -> torch.Tensor:
+        if cond_t.shape[-2:] != target_hw:
+            cond_t = F.adaptive_avg_pool2d(cond_t, target_hw)
 
-        if sst_vec is None:
-            sst_vec = cond_flat.new_zeros((cond_flat.shape[0], self.sst_pc_hidden))
-        if sst_vec.dim() != 2:
-            raise ValueError(f"sst_vec must be [B, H], got {tuple(sst_vec.shape)}")
+        if sst_hist.dim() == 3:
+            sst_hist = sst_hist.unsqueeze(1)
+        if sst_hist.dim() != 4:
+            raise ValueError(f"sst_hist must be [B,T,H,W], got {tuple(sst_hist.shape)}")
+        if sst_hist.shape[1] != self.sst_hist_channels:
+            raise ValueError(f"sst_hist channels {sst_hist.shape[1]} != expected {self.sst_hist_channels}")
+        if sst_hist.shape[-2:] != target_hw:
+            sst_hist = F.adaptive_avg_pool2d(sst_hist, target_hw)
 
-        cond_vec = torch.cat([cond_flat, sst_vec], dim=1)
-        expected = self.cond_channels * self.cond_pc_k + self.sst_pc_hidden
-        if cond_vec.shape[1] != expected:
-            raise ValueError(f"cond_vec dim mismatch: {cond_vec.shape[1]} vs {expected}")
-        return cond_vec
+        cond_map = torch.cat([cond_t, sst_hist], dim=1)
+        return cond_map
 
     def forward_step(
         self,
-        cond_pcs_t: torch.Tensor,
+        cond_t: torch.Tensor,
         seas_anom_t: torch.Tensor,
         ec_base_t: torch.Tensor,
         prev_pred: torch.Tensor,
-        sst_vec: Optional[torch.Tensor] = None,
+        sst_hist: torch.Tensor,
         state: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
-        # seas_anom_t/ec_base_t: [B, 1, H, W]
-        # prev_pred: [B, H, W] or [B, 1, H, W]
+        # cond_t: [B, 7, Hc, Wc]
+        # seas_anom_t/ec_base_t: [B, 1, 60, 70]
+        # prev_pred: [B, 60, 70] or [B, 1, 60, 70]
         if prev_pred.dim() == 3:
             prev_pred = prev_pred.unsqueeze(1)
 
-        cond_vec = self._build_cond_vec(cond_pcs_t, sst_vec)
+        target_hw = seas_anom_t.shape[-2:]
+        cond_map = self._build_cond_map(cond_t, sst_hist, target_hw)
 
         x = torch.cat([seas_anom_t, prev_pred], dim=1)
         x = self.enc_conv1(x)
-        x = self.enc_norm1(x)
-        x = self.enc_film1(x, cond_vec)
+        x = self.enc_spade1(x, cond_map)
         x = F.gelu(x)
+        x = self.enc_drop1(x)
 
         x = self.enc_conv2(x)
-        x = self.enc_norm2(x)
-        x = self.enc_film2(x, cond_vec)
+        x = self.enc_spade2(x, cond_map)
         x = F.gelu(x)
+        x = self.enc_drop2(x)
 
         if state is None:
             h_out, w_out = x.shape[-2], x.shape[-1]
@@ -252,8 +236,9 @@ class Seas2RainModel(nn.Module):
         h, state = self.convlstm(x, state)
         y = self.up_conv(h)
         y = self.pixel_shuffle(y)
-        y = self.dec_film(y, cond_vec)
+        y = self.dec_spade(y, cond_map)
         y = F.gelu(y)
+        y = self.dec_drop(y)
         delta = self.out_conv(y).squeeze(1)
         pred = ec_base_t[:, 0] + delta
         pred = torch.nan_to_num(pred, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -261,21 +246,15 @@ class Seas2RainModel(nn.Module):
 
     def forward(
         self,
-        cond_pcs: torch.Tensor,
+        cond: torch.Tensor,
         seas_anom: torch.Tensor,
         ec_base: torch.Tensor,
-        sst_pcs: Optional[torch.Tensor] = None,
-        sst_vec: Optional[torch.Tensor] = None,
+        sst_hist: torch.Tensor,
         prev_pred: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # cond_pcs: [B, T, V, K]
-        bsz, tdim = cond_pcs.shape[0], cond_pcs.shape[1]
+        # cond: [B, T, 7, Hc, Wc]
+        bsz, tdim = cond.shape[0], cond.shape[1]
         preds: List[torch.Tensor] = []
-
-        if sst_vec is None:
-            if sst_pcs is None:
-                raise ValueError("sst_pcs or sst_vec must be provided")
-            sst_vec = self.encode_sst_pcs(sst_pcs)
 
         prev_seq: Optional[torch.Tensor] = None
         if prev_pred is None:
@@ -299,11 +278,11 @@ class Seas2RainModel(nn.Module):
             else:
                 prev_in = prev
             pred_t, state = self.forward_step(
-                cond_pcs_t=cond_pcs[:, t],
+                cond_t=cond[:, t],
                 seas_anom_t=seas_anom[:, t],
                 ec_base_t=ec_base[:, t],
                 prev_pred=prev_in,
-                sst_vec=sst_vec,
+                sst_hist=sst_hist,
                 state=state,
             )
             preds.append(pred_t)

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime
 
 import torch
@@ -44,6 +45,8 @@ for _path in (save_weight_path, picture_save_path, log_path):
 
 run_id = "default"
 
+RUN_ID_TIME_FORMAT = "%Y%m%d_%H%M%S"
+
 modelconfig = {
     "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
     "batch_size": 16,
@@ -85,9 +88,10 @@ modelconfig = {
     "autoregressive": True,
     "ssr_start": 1.0,
     "ssr_end": 0.0,
-    "ssr_decay_epochs": 30,
+    "ssr_decay_epochs": 300,
     "prev_pred_init": "ec_base",
     "detach_rollout": False,
+    "spade_hidden": 256,
 }
 
 
@@ -97,13 +101,42 @@ def _update_runtime_paths(current_run_id: str) -> None:
     modelconfig["log_path"] = os.path.join(log_path, f"run_{current_run_id}")
 
 
+def _default_run_id() -> str:
+    return datetime.now().strftime(RUN_ID_TIME_FORMAT)
+
+
+def _sanitize_run_id(user_run_id: str) -> str:
+    sanitized = re.sub(r'[<>:"/\\|?*]+', "_", user_run_id.strip())
+    sanitized = sanitized.rstrip(". ")
+    return sanitized
+
+
+def _get_run_id_from_user() -> str:
+    try:
+        user_run_id = input("Enter run_id (leave blank to use timestamp): ").strip()
+    except EOFError:
+        user_run_id = ""
+
+    if not user_run_id:
+        return _default_run_id()
+
+    sanitized_run_id = _sanitize_run_id(user_run_id)
+    if not sanitized_run_id:
+        return _default_run_id()
+
+    if sanitized_run_id != user_run_id:
+        print(f"Invalid path characters were replaced. Using run_id: {sanitized_run_id}")
+
+    return sanitized_run_id
+
+
 def enable_auto_create_folders(enable: bool = True):
-    """Enable/disable timestamped run folders and update modelconfig paths."""
+    """Enable/disable runtime folders and update modelconfig paths."""
     global AUTO_CREATE_FOLDERS_ON_IMPORT, run_id
     AUTO_CREATE_FOLDERS_ON_IMPORT = enable
 
     if enable:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = _get_run_id_from_user()
         _update_runtime_paths(run_id)
         for _path in (
             modelconfig["save_weight_path"],

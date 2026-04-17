@@ -3,17 +3,16 @@ import glob
 import random
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 import xarray as xr
 from scipy.interpolate import griddata
-from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 import tqdm
+from dataclasses import dataclass
 
 # Ensure repo parent is on sys.path so absolute imports like 'HydroSynth' work.
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -35,7 +34,7 @@ config.enable_auto_create_folders()
 LEADS = 6
 COND_VARS = ["h500", "slp", "t2m", "t850", "u850", "v850", "sst"]
 TARGET_HW = (60, 70)
-
+BATCH_KEYS = ("cond", "seas_anom", "ec_base", "obs_target", "obs_mask", "sst_hist")
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -43,13 +42,11 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def build_init_dates() -> pd.DatetimeIndex:
     dates = pd.date_range(start="1994-01-01", end="2024-09-01", freq="MS")
     drop = {pd.Timestamp("2011-09-01"), pd.Timestamp("2011-10-01")}
     dates = pd.DatetimeIndex([d for d in dates if d not in drop])
     return dates
-
 
 def split_indices_by_date(init_dates: pd.DatetimeIndex) -> Dict[str, np.ndarray]:
     train_end = pd.Timestamp("2015-12-01")
@@ -63,7 +60,6 @@ def split_indices_by_date(init_dates: pd.DatetimeIndex) -> Dict[str, np.ndarray]
 
     return {"train": train_idx, "val": val_idx, "test": test_idx}
 
-
 def _normalize_station_coords(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if df["Long"].abs().max() > 180:
@@ -72,10 +68,8 @@ def _normalize_station_coords(df: pd.DataFrame) -> pd.DataFrame:
         df["Lat"] = df["Lat"] / 100.0
     return df
 
-
 def _month_start(ts: pd.Timestamp) -> pd.Timestamp:
     return pd.Timestamp(year=ts.year, month=ts.month, day=1)
-
 
 def _parse_date_from_path(path: str) -> Optional[pd.Timestamp]:
     name = os.path.basename(path)
@@ -87,14 +81,12 @@ def _parse_date_from_path(path: str) -> Optional[pd.Timestamp]:
     month = int(yyyymm[4:])
     return pd.Timestamp(year=year, month=month, day=1)
 
-
 def _sel_region(ds: xr.Dataset) -> xr.Dataset:
     if "longitude" in ds.coords and "latitude" in ds.coords:
         return ds.sel(longitude=slice(70, 140), latitude=slice(60, 0))
     if "lon" in ds.coords and "lat" in ds.coords:
         return ds.sel(lon=slice(70, 140), lat=slice(60, 0))
     return ds
-
 
 def _get_lat_lon(ds: xr.Dataset) -> Tuple[np.ndarray, np.ndarray]:
     if "latitude" in ds.coords:
@@ -113,7 +105,6 @@ def _get_lat_lon(ds: xr.Dataset) -> Tuple[np.ndarray, np.ndarray]:
 
     return lat, lon
 
-
 def _build_target_grid(lat: np.ndarray, lon: np.ndarray, target_hw: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
     if len(lat) == target_hw[0] and len(lon) == target_hw[1]:
         return lat.astype(np.float32), lon.astype(np.float32)
@@ -126,7 +117,6 @@ def _build_target_grid(lat: np.ndarray, lon: np.ndarray, target_hw: Tuple[int, i
         grid_lats = np.linspace(lat_min, lat_max, target_hw[0], dtype=np.float32)
     grid_lons = np.linspace(lon_min, lon_max, target_hw[1], dtype=np.float32)
     return grid_lats, grid_lons
-
 
 def read_modes_data(
     cache_path: str,
@@ -142,7 +132,7 @@ def read_modes_data(
         grid_lons = cached["grid_lons"].astype(np.float32)
         return tp_raw, cond_raw, pd.DatetimeIndex(init_dates), grid_lats, grid_lons
 
-    file_list = utils.read_nc_to_npy(199401, 202409, data_path=seas_nc_path or "D:\\MODESv21_ecmwf_seas51")
+    file_list = utils.read_nc_to_npy(199401, 202409, data_path=seas_nc_path or "D:\\MODESv21_ecmwf_seas51")# 读取SERS5模式数据
 
     tp_list: List[np.ndarray] = []
     cond_list: List[np.ndarray] = []
@@ -209,7 +199,6 @@ def read_modes_data(
     )
     return tp_raw.astype(np.float32), cond_raw.astype(np.float32), init_dates, grid_lats, grid_lons
 
-
 def _parse_ersst_date(path: str) -> Optional[pd.Timestamp]:
     name = os.path.basename(path)
     match = re.search(r"(\d{6})", name)
@@ -219,7 +208,6 @@ def _parse_ersst_date(path: str) -> Optional[pd.Timestamp]:
     year = int(yyyymm[:4])
     month = int(yyyymm[4:])
     return pd.Timestamp(year=year, month=month, day=1)
-
 
 def read_ersst_data(
     ersst_dir: str,
@@ -286,7 +274,6 @@ def read_ersst_data(
     )
     return sst.astype(np.float32), dates
 
-
 def build_sst_history(
     init_dates: pd.DatetimeIndex,
     sst: np.ndarray,
@@ -316,7 +303,6 @@ def build_sst_history(
 
     return np.stack(hist, axis=0).astype(np.float32), np.asarray(keep, dtype=np.int64)
 
-
 def normalize_sst_hist(sst_hist: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, float, float]:
     train_vals = sst_hist[train_idx]
     mean = float(train_vals.mean())
@@ -324,77 +310,6 @@ def normalize_sst_hist(sst_hist: np.ndarray, train_idx: np.ndarray) -> Tuple[np.
     std = max(std, 1e-6)
     sst_norm = (sst_hist - mean) / std
     return sst_norm.astype(np.float32), mean, std
-
-
-def compute_eof_basis(x: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute EOF basis from samples x: [N, F]. Returns (mean[F], basis[k, F])."""
-    x = np.asarray(x, dtype=np.float64)
-    n_samples, n_features = x.shape
-    if k > min(n_samples, n_features):
-        raise ValueError(f"EOF k={k} exceeds min(n_samples, n_features)={min(n_samples, n_features)}")
-    mean = x.mean(axis=0)
-    x_centered = x - mean
-    _, _, vt = np.linalg.svd(x_centered, full_matrices=False)
-    basis = vt[:k].astype(np.float32)
-    return mean.astype(np.float32), basis
-
-
-def project_pcs(x: np.ndarray, mean: np.ndarray, basis: np.ndarray, block_size: int = 2048) -> np.ndarray:
-    """Project samples x: [N, F] to PC scores using mean[F] and basis[k, F]."""
-    x = np.asarray(x, dtype=np.float32)
-    mean = mean.astype(np.float32)
-    basis_t = basis.astype(np.float32).T
-    out = np.empty((x.shape[0], basis.shape[0]), dtype=np.float32)
-    for i in range(0, x.shape[0], block_size):
-        xi = x[i : i + block_size] - mean
-        out[i : i + block_size] = xi @ basis_t
-    return out
-
-
-def compute_cond_pcs(
-    cond_norm: np.ndarray,
-    train_idx: np.ndarray,
-    pc_k: int,
-    block_size: int = 2048,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute per-variable EOF/PCs for cond.
-    Returns (cond_pcs [N,L,V,K], cond_pc_mean [V,F], cond_pc_basis [V,K,F])."""
-    n, l, v, h, w = cond_norm.shape
-    f = h * w
-    cond_pcs = np.zeros((n, l, v, pc_k), dtype=np.float32)
-    cond_pc_mean = np.zeros((v, f), dtype=np.float32)
-    cond_pc_basis = np.zeros((v, pc_k, f), dtype=np.float32)
-
-    for vi in range(v):
-        x_train = cond_norm[train_idx, :, vi].reshape(-1, f)
-        mean, basis = compute_eof_basis(x_train, pc_k)
-        cond_pc_mean[vi] = mean
-        cond_pc_basis[vi] = basis
-
-        x_all = cond_norm[:, :, vi].reshape(-1, f)
-        pcs = project_pcs(x_all, mean, basis, block_size=block_size)
-        cond_pcs[:, :, vi] = pcs.reshape(n, l, pc_k)
-
-    return cond_pcs, cond_pc_mean, cond_pc_basis
-
-
-def compute_sst_pcs(
-    sst_hist: np.ndarray,
-    train_idx: np.ndarray,
-    pc_k: int,
-    block_size: int = 2048,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute EOF/PCs for SST history.
-    Returns (sst_pcs [N,T,K], sst_pc_mean [F], sst_pc_basis [K,F])."""
-    n, t, h, w = sst_hist.shape
-    f = h * w
-    x_train = sst_hist[train_idx].reshape(-1, f)
-    mean, basis = compute_eof_basis(x_train, pc_k)
-    x_all = sst_hist.reshape(-1, f)
-    pcs = project_pcs(x_all, mean, basis, block_size=block_size)
-    sst_pcs = pcs.reshape(n, t, pc_k)
-    return sst_pcs, mean, basis
-
 
 def calc_precip_percent_anomaly(
     tp_tensor: torch.Tensor,
@@ -438,7 +353,6 @@ def calc_precip_percent_anomaly(
 
     return pa, climatology
 
-
 def compute_cond_stats(cond_raw: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     # cond_raw: [N, L, 7, H, W]
     sum_x = np.zeros((LEADS, len(COND_VARS)), dtype=np.float64)
@@ -461,14 +375,12 @@ def compute_cond_stats(cond_raw: np.ndarray, train_idx: np.ndarray) -> Tuple[np.
     std = np.maximum(std, 1e-4)
     return mean.astype(np.float32), std.astype(np.float32)
 
-
 def normalize_cond(cond_raw: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     # cond_raw: [N, L, 7, H, W], mean/std: [L, 7]
     x = (cond_raw - mean[None, :, :, None, None]) / std[None, :, :, None, None]
     x = np.clip(x, -6.0, 6.0)
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return x.astype(np.float32)
-
 
 def prepare_observe_data(
     csv_path: str,
@@ -543,7 +455,6 @@ def prepare_observe_data(
     )
     return obs_grid, obs_mask, obs_dates
 
-
 def build_obs_targets(
     init_dates: pd.DatetimeIndex,
     obs_grid: np.ndarray,
@@ -565,7 +476,6 @@ def build_obs_targets(
             target[i, l] = obs_grid[j]
             mask[i, l] = obs_mask[j]
     return target, mask
-
 
 def prepare_data() -> Dict[str, np.ndarray]:
     cfg = config.modelconfig
@@ -589,7 +499,7 @@ def prepare_data() -> Dict[str, np.ndarray]:
     cond_raw = cond_raw[keep_mask]
     init_dates = pd.DatetimeIndex([d for d in init_dates if d in allowed])
 
-    ersst_dir = cfg.get("ersst_dir", r"D:\ersst_data")
+    ersst_dir = cfg.get("ersst_dir", r"D:\ersst_data")# 海温数据，ERSST5.0
     sst_window = int(cfg.get("sst_window", 12))
     ersst_cache = os.path.join(cache_dir, "ersst_ssta_cache.npz")
     sst_raw, sst_dates = read_ersst_data(ersst_dir=ersst_dir, cache_path=ersst_cache)
@@ -656,56 +566,9 @@ def prepare_data() -> Dict[str, np.ndarray]:
             init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
         )
 
-    cond_pc_k = int(cfg.get("cond_pc_k", 8))
-    sst_pc_k = int(cfg.get("sst_pc_k", 8))
-
-    cond_pcs_cache = os.path.join(cache_dir, f"cond_pcs_k{cond_pc_k}_n{len(init_dates)}.npz")
-    cond_pcs = None
-    if os.path.exists(cond_pcs_cache):
-        cached = np.load(cond_pcs_cache, allow_pickle=True)
-        cached_dates = cached["init_dates"] if "init_dates" in cached else None
-        if cached_dates is not None:
-            cached_dates = pd.to_datetime(cached_dates.astype(str))
-        if cached_dates is not None and len(cached_dates) == len(init_dates) and all(cached_dates == init_dates):
-            cond_pcs = cached["cond_pcs"].astype(np.float32)
-            if cond_pcs.shape[:3] != (len(init_dates), LEADS, len(COND_VARS)) or cond_pcs.shape[3] != cond_pc_k:
-                cond_pcs = None
-
-    if cond_pcs is None:
-        cond_pcs, cond_pc_mean, cond_pc_basis = compute_cond_pcs(cond_norm, splits["train"], cond_pc_k)
-        np.savez_compressed(
-            cond_pcs_cache,
-            cond_pcs=cond_pcs.astype(np.float32),
-            cond_pc_mean=cond_pc_mean.astype(np.float32),
-            cond_pc_basis=cond_pc_basis.astype(np.float32),
-            init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
-        )
-
-    sst_pcs_cache = os.path.join(cache_dir, f"sst_pcs_k{sst_pc_k}_n{len(init_dates)}.npz")
-    sst_pcs = None
-    if os.path.exists(sst_pcs_cache):
-        cached = np.load(sst_pcs_cache, allow_pickle=True)
-        cached_dates = cached["init_dates"] if "init_dates" in cached else None
-        if cached_dates is not None:
-            cached_dates = pd.to_datetime(cached_dates.astype(str))
-        if cached_dates is not None and len(cached_dates) == len(init_dates) and all(cached_dates == init_dates):
-            sst_pcs = cached["sst_pcs"].astype(np.float32)
-            if sst_pcs.shape[:2] != (len(init_dates), sst_window) or sst_pcs.shape[2] != sst_pc_k:
-                sst_pcs = None
-
-    if sst_pcs is None:
-        sst_pcs, sst_pc_mean, sst_pc_basis = compute_sst_pcs(sst_hist, splits["train"], sst_pc_k)
-        np.savez_compressed(
-            sst_pcs_cache,
-            sst_pcs=sst_pcs.astype(np.float32),
-            sst_pc_mean=sst_pc_mean.astype(np.float32),
-            sst_pc_basis=sst_pc_basis.astype(np.float32),
-            init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
-        )
-
     obs_csv_path = cfg.get(
         "observe_csv_path",
-        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "utils", "observe_data24.csv")),
+        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "utils", "observe_data24.csv")),#中国站点观测降水数据
     )
     obs_cache_path = os.path.join(cache_dir, "observe_grid_cache_199401_202412_60x70.npz")
     obs_grid, obs_month_mask, obs_dates = prepare_observe_data(
@@ -729,10 +592,10 @@ def prepare_data() -> Dict[str, np.ndarray]:
     obs_mask = obs_mask[:, :, None, :, :].astype(np.float32)
 
     data = {
-        "cond_pcs": cond_pcs.astype(np.float32),
+        "cond": cond_norm.astype(np.float32),
         "seas_anom": seas_anom.astype(np.float32),
         "ec_base": ec_base.astype(np.float32),
-        "sst_pcs": sst_pcs.astype(np.float32),
+        "sst_hist": sst_hist.astype(np.float32),
         "sst_mean": float(sst_mean),
         "sst_std": float(sst_std),
         "obs_target": obs_target.astype(np.float32),
@@ -745,18 +608,16 @@ def prepare_data() -> Dict[str, np.ndarray]:
     validate_data_bundle(data)
     return data
 
-
 def validate_data_bundle(data: Dict[str, np.ndarray]) -> None:
     n = len(data["init_dates"])
-    for k in ("cond_pcs", "seas_anom", "ec_base", "sst_pcs", "obs_target", "obs_mask"):
+    for k in ("cond", "seas_anom", "ec_base", "sst_hist", "obs_target", "obs_mask"):
         if data[k].shape[0] != n:
             raise ValueError(f"{k} length mismatch: {data[k].shape[0]} vs {n}")
 
-    if data["cond_pcs"].ndim != 4 or data["cond_pcs"].shape[1] != LEADS or data["cond_pcs"].shape[2] != len(COND_VARS):
-        raise ValueError(f"cond_pcs shape invalid: {data['cond_pcs'].shape}")
-    sst_window = int(config.modelconfig.get("sst_window", 12))
-    if data["sst_pcs"].ndim != 3 or data["sst_pcs"].shape[1] != sst_window:
-        raise ValueError(f"sst_pcs shape invalid: {data['sst_pcs'].shape}")
+    if data["cond"].ndim != 5 or data["cond"].shape[1] != LEADS or data["cond"].shape[2] != len(COND_VARS):
+        raise ValueError(f"cond shape invalid: {data['cond'].shape}")
+    if data["sst_hist"].ndim != 4:
+        raise ValueError(f"sst_hist shape invalid: {data['sst_hist'].shape}")
     if tuple(data["seas_anom"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
         raise ValueError(f"seas_anom shape invalid: {data['seas_anom'].shape}")
     if tuple(data["ec_base"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
@@ -766,66 +627,102 @@ def validate_data_bundle(data: Dict[str, np.ndarray]) -> None:
     if tuple(data["obs_mask"].shape[1:]) != (LEADS, 1, TARGET_HW[0], TARGET_HW[1]):
         raise ValueError(f"obs_mask shape invalid: {data['obs_mask'].shape}")
 
+@dataclass
+class TensorBatchStore:
+    tensors: Dict[str, torch.Tensor]
+    split_indices: Dict[str, torch.Tensor]
+    batch_size: int
+    storage_device: torch.device
+    train_device: torch.device
 
-class Seas2RainDataset(Dataset):
-    def __init__(self, data: Dict[str, np.ndarray], indices: np.ndarray):
-        self.cond_pcs = data["cond_pcs"]
-        self.seas_anom = data["seas_anom"]
-        self.ec_base = data["ec_base"]
-        self.sst_pcs = data["sst_pcs"]
-        self.obs_target = data["obs_target"]
-        self.obs_mask = data["obs_mask"]
-        self.indices = np.asarray(indices, dtype=np.int64)
-
-    def __len__(self) -> int:
-        return int(self.indices.shape[0])
-
-    def __getitem__(self, i: int):
-        idx = int(self.indices[i])
-        cond_pcs = torch.from_numpy(self.cond_pcs[idx])
-        seas_anom = torch.from_numpy(self.seas_anom[idx])
-        ec_base = torch.from_numpy(self.ec_base[idx])
-        sst_pcs = torch.from_numpy(self.sst_pcs[idx])
-        obs_target = torch.from_numpy(self.obs_target[idx])
-        obs_mask = torch.from_numpy(self.obs_mask[idx])
-        return cond_pcs, seas_anom, ec_base, obs_target, obs_mask, sst_pcs
+    def split_size(self, split: str) -> int:
+        return int(self.split_indices[split].shape[0])
 
 
-def build_dataloaders(data: Dict[str, np.ndarray], device: torch.device):
-    train_ds = Seas2RainDataset(data, data["split_indices"]["train"])
-    val_ds = Seas2RainDataset(data, data["split_indices"]["val"])
-    test_ds = Seas2RainDataset(data, data["split_indices"]["test"])
+def _resolve_data_storage_device(train_device: torch.device) -> torch.device:
+    storage_mode = str(config.modelconfig.get("dataset_storage_device", "auto")).lower()
+    if storage_mode in ("auto", "device", "train", "gpu", "cuda"):
+        return train_device if train_device.type == "cuda" else torch.device("cpu")
+    if storage_mode == "cpu":
+        return torch.device("cpu")
+    return torch.device(storage_mode)
 
+
+def _materialize_batch_tensors(
+    data: Dict[str, np.ndarray],
+    storage_device: torch.device,
+    pin_memory: bool,
+) -> Dict[str, torch.Tensor]:
+    tensors: Dict[str, torch.Tensor] = {}
+    for key in BATCH_KEYS:
+        tensor = torch.from_numpy(np.ascontiguousarray(data[key]))
+        if storage_device.type == "cpu":
+            if pin_memory:
+                tensor = tensor.pin_memory()
+        else:
+            tensor = tensor.to(storage_device)
+        tensors[key] = tensor
+    return tensors
+
+
+def build_batch_store(data: Dict[str, np.ndarray], train_device: torch.device) -> TensorBatchStore:
     batch_size = int(config.modelconfig.get("batch_size", 8))
-    num_workers = int(config.modelconfig.get("num_workers", 0))
-    pin_memory = str(device).startswith("cuda")
+    storage_device = _resolve_data_storage_device(train_device)
+    pin_memory = storage_device.type == "cpu" and train_device.type == "cuda"
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-    )
-    return train_loader, val_loader, test_loader
+    try:
+        tensors = _materialize_batch_tensors(data, storage_device=storage_device, pin_memory=pin_memory)
+        split_indices = {
+            split: torch.as_tensor(indices, dtype=torch.long, device=storage_device)
+            for split, indices in data["split_indices"].items()
+        }
+    except RuntimeError as e:
+        if storage_device.type != "cuda" or "out of memory" not in str(e).lower():
+            raise
+        print("Preloading full dataset to CUDA failed; falling back to pinned CPU tensors.")
+        torch.cuda.empty_cache()
+        storage_device = torch.device("cpu")
+        tensors = _materialize_batch_tensors(data, storage_device=storage_device, pin_memory=train_device.type == "cuda")
+        split_indices = {
+            split: torch.as_tensor(indices, dtype=torch.long, device=storage_device)
+            for split, indices in data["split_indices"].items()
+        }
 
+    return TensorBatchStore(
+        tensors=tensors,
+        split_indices=split_indices,
+        batch_size=batch_size,
+        storage_device=storage_device,
+        train_device=train_device,
+    )
+
+
+def count_split_batches(batch_store: TensorBatchStore, split: str) -> int:
+    size = batch_store.split_size(split)
+    return (size + batch_store.batch_size - 1) // batch_store.batch_size
+
+
+def iter_split_batches(
+    batch_store: TensorBatchStore,
+    split: str,
+    shuffle: bool = False,
+) -> Iterator[Dict[str, torch.Tensor]]:
+    indices = batch_store.split_indices[split]
+    if shuffle and indices.numel() > 1:
+        perm = torch.randperm(indices.shape[0], device=indices.device)
+        ordered_indices = indices.index_select(0, perm)
+    else:
+        ordered_indices = indices
+
+    for start in range(0, int(ordered_indices.shape[0]), batch_store.batch_size):
+        batch_indices = ordered_indices[start : start + batch_store.batch_size]
+        batch: Dict[str, torch.Tensor] = {}
+        for key, tensor in batch_store.tensors.items():
+            batch_tensor = tensor.index_select(0, batch_indices)
+            if batch_tensor.device != batch_store.train_device:
+                batch_tensor = batch_tensor.to(batch_store.train_device, non_blocking=True)
+            batch[key] = batch_tensor
+        yield batch
 
 def build_model(device: torch.device) -> model.Seas2RainModel:
     cfg = config.modelconfig
@@ -834,15 +731,17 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
     decoder_channels = int(cfg.get("seas2rain_decoder_channels", 32))
     encoder_channels = int(cfg.get("seas2rain_encoder_channels", 64))
     ps_scale = int(cfg.get("seas2rain_ps_scale", 2))
-    cond_pc_k = int(cfg.get("cond_pc_k", 8))
-    sst_pc_k = int(cfg.get("sst_pc_k", 8))
-    sst_pc_hidden = int(cfg.get("sst_pc_hidden", 16))
+    spade_hidden = int(cfg.get("spade_hidden", 16))
+    sst_window = int(cfg.get("sst_window", 12))
+    dropout = float(cfg.get("dropout", 0.5))
+    cond_dropout = float(cfg.get("cond_dropout", 0.5))
 
     net = model.Seas2RainModel(
         cond_channels=len(COND_VARS),
-        cond_pc_k=cond_pc_k,
-        sst_pc_k=sst_pc_k,
-        sst_pc_hidden=sst_pc_hidden,
+        sst_hist_channels=sst_window,
+        spade_hidden=spade_hidden,
+        dropout=dropout,
+        cond_dropout=cond_dropout,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         encoder_channels=encoder_channels,
@@ -851,7 +750,6 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
     ).to(device)
     return net
 
-
 def _ssr_ratio(epoch: int, start: float, end: float, decay_epochs: int) -> float:
     if decay_epochs <= 0:
         return float(end)
@@ -859,7 +757,6 @@ def _ssr_ratio(epoch: int, start: float, end: float, decay_epochs: int) -> float
         return float(end)
     progress = min(max(epoch, 0), decay_epochs) / float(decay_epochs)
     return float(max(end, start - (start - end) * progress))
-
 
 def _init_prev_pred(ec_base: torch.Tensor, seas_anom: torch.Tensor, mode: str) -> torch.Tensor:
     # ec_base/seas_anom: [B, T, 1, H, W]
@@ -871,20 +768,19 @@ def _init_prev_pred(ec_base: torch.Tensor, seas_anom: torch.Tensor, mode: str) -
         return ec_base.new_zeros((ec_base.shape[0], ec_base.shape[-2], ec_base.shape[-1]))
     raise ValueError(f"Unknown prev_pred_init mode: {mode}")
 
-
 def autoregressive_rollout(
     net: model.Seas2RainModel,
-    cond_pcs: torch.Tensor,
+    cond: torch.Tensor,
     seas_anom: torch.Tensor,
     ec_base: torch.Tensor,
-    sst_vec: Optional[torch.Tensor],
+    sst_hist: torch.Tensor,
     target: Optional[torch.Tensor],
     teacher_forcing_ratio: float,
     detach_rollout: bool,
     prev_pred_init: str,
 ) -> torch.Tensor:
-    # cond_pcs: [B, T, V, K]
-    bsz, tdim = cond_pcs.shape[0], cond_pcs.shape[1]
+    # cond: [B, T, 7, H, W]
+    bsz, tdim = cond.shape[0], cond.shape[1]
     prev_pred = _init_prev_pred(ec_base, seas_anom, prev_pred_init)
     preds: List[torch.Tensor] = []
 
@@ -894,24 +790,23 @@ def autoregressive_rollout(
             prev_in = prev_pred
         else:
             if target is not None and teacher_forcing_ratio > 0.0:
-                use_teacher = torch.rand(bsz, device=cond_pcs.device) < teacher_forcing_ratio
+                use_teacher = torch.rand(bsz, device=cond.device) < teacher_forcing_ratio
                 prev_in = torch.where(use_teacher[:, None, None], target[:, t - 1, 0], prev_pred)
             else:
                 prev_in = prev_pred
 
         pred_t, state = net.forward_step(
-            cond_pcs_t=cond_pcs[:, t],
+            cond_t=cond[:, t],
             seas_anom_t=seas_anom[:, t],
             ec_base_t=ec_base[:, t],
             prev_pred=prev_in,
-            sst_vec=sst_vec,
+            sst_hist=sst_hist,
             state=state,
         )
         preds.append(pred_t)
         prev_pred = pred_t.detach() if detach_rollout else pred_t
 
     return torch.stack(preds, dim=1)
-
 
 def differentiable_acc_loss(
     pred: torch.Tensor,
@@ -951,92 +846,88 @@ def differentiable_acc_loss(
     valid_count = int(valid.sum().item())
     return loss, valid_count
 
-
-def init_metric_state(leads: int = LEADS) -> Dict[str, np.ndarray]:
+def init_metric_state(
+    leads: int = LEADS,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    metric_device = device if device is not None else torch.device("cpu")
     return {
-        "mse_sum": np.zeros(leads, dtype=np.float64),
-        "count": np.zeros(leads, dtype=np.float64),
-        "acc_sum": np.zeros(leads, dtype=np.float64),
-        "acc_cnt": np.zeros(leads, dtype=np.float64),
+        "mse_sum": torch.zeros(leads, dtype=torch.float64, device=metric_device),
+        "count": torch.zeros(leads, dtype=torch.float64, device=metric_device),
+        "acc_sum": torch.zeros(leads, dtype=torch.float64, device=metric_device),
+        "acc_cnt": torch.zeros(leads, dtype=torch.float64, device=metric_device),
     }
 
-
-def _corrcoef_1d(x: torch.Tensor, y: torch.Tensor) -> float:
-    x = x.float()
-    y = y.float()
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = torch.sqrt((x * x).sum() * (y * y).sum())
-    if denom <= 1e-12:
-        return float("nan")
-    return float(((x * y).sum() / denom).item())
-
-
 def update_metrics(
-    state: Dict[str, np.ndarray],
+    state: Dict[str, torch.Tensor],
     pred: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
 ) -> None:
     # pred/target/mask: [B, T, H, W]
-    bsz, leads, _, _ = pred.shape
-    err = pred - target
-    sq_err = err * err
+    m = mask.float()
+    sq_err = (pred - target) ** 2
+    state["mse_sum"] += (sq_err * m).sum(dim=(0, 2, 3)).double()
+    state["count"] += m.sum(dim=(0, 2, 3)).double()
 
-    for t in range(leads):
-        mt = mask[:, t]
-        count = float(mt.sum().item())
-        if count <= 0:
-            continue
-        state["mse_sum"][t] += float(sq_err[:, t][mt].sum().item())
-        state["count"][t] += count
+    count = m.sum(dim=(2, 3))
+    valid = count > 1.0
+    count = count.clamp_min(1.0)
 
-    for b in range(bsz):
-        for t in range(leads):
-            mt = mask[b, t]
-            n_valid = int(mt.sum().item())
-            if n_valid < 2:
-                continue
-            c = _corrcoef_1d(pred[b, t][mt], target[b, t][mt])
-            if np.isfinite(c):
-                state["acc_sum"][t] += c
-                state["acc_cnt"][t] += 1.0
+    pred_mean = (pred * m).sum(dim=(2, 3)) / count
+    target_mean = (target * m).sum(dim=(2, 3)) / count
 
+    pred_anom = (pred - pred_mean[:, :, None, None]) * m
+    target_anom = (target - target_mean[:, :, None, None]) * m
 
-def finalize_metrics(state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    cov = (pred_anom * target_anom).sum(dim=(2, 3))
+    pred_std = torch.sqrt((pred_anom ** 2).sum(dim=(2, 3)) + 1e-12)
+    target_std = torch.sqrt((target_anom ** 2).sum(dim=(2, 3)) + 1e-12)
+    acc = cov / (pred_std * target_std + 1e-12)
+    acc = torch.where(valid, acc, torch.zeros_like(acc))
+
+    state["acc_sum"] += acc.sum(dim=0).double()
+    state["acc_cnt"] += valid.sum(dim=0).double()
+
+def finalize_metrics(state: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
     eps = 1e-12
-    rmse = np.sqrt(state["mse_sum"] / np.maximum(state["count"], eps))
-    acc = state["acc_sum"] / np.maximum(state["acc_cnt"], 1.0)
-    acc[state["acc_cnt"] < 1] = np.nan
-    return {"rmse": rmse, "acc": acc}
+    count = torch.clamp(state["count"], min=eps)
+    rmse = torch.sqrt(state["mse_sum"] / count)
+    acc = state["acc_sum"] / torch.clamp(state["acc_cnt"], min=1.0)
+    acc = torch.where(state["acc_cnt"] > 0, acc, torch.full_like(acc, float("nan")))
+    return {
+        "rmse": rmse.detach().cpu().numpy(),
+        "acc": acc.detach().cpu().numpy(),
+    }
 
-
-def evaluate_baseline(loader: DataLoader, device: torch.device) -> Dict[str, np.ndarray]:
-    state = init_metric_state()
-    with torch.no_grad():
-        for _, _, ec_base, target, obs_mask, _ in loader:
-            ec_base = ec_base.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            obs_mask = obs_mask.to(device, non_blocking=True)
-            pred = ec_base[:, :, 0]
-            target2 = target[:, :, 0]
-            mask2 = obs_mask[:, :, 0] > 0.5
+def evaluate_baseline(batch_store: TensorBatchStore, split: str) -> Dict[str, np.ndarray]:
+    state = init_metric_state(device=batch_store.train_device)
+    with torch.inference_mode():
+        for batch in iter_split_batches(batch_store, split=split, shuffle=False):
+            pred = batch["ec_base"][:, :, 0]
+            target2 = batch["obs_target"][:, :, 0]
+            mask2 = batch["obs_mask"][:, :, 0] > 0.5
             update_metrics(state, pred, target2, mask2)
     return finalize_metrics(state)
-
 
 def format_metric_line(name: str, values: np.ndarray) -> str:
     parts = [f"L{i+1}:{float(values[i]):.4f}" if np.isfinite(values[i]) else f"L{i+1}:nan" for i in range(len(values))]
     return f"{name}: " + ", ".join(parts)
-
 
 def train() -> None:
     seed = int(config.modelconfig.get("seed", 42))
     set_seed(seed)
 
     device = config.modelconfig["device"]
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+
     data = prepare_data()
-    train_loader, val_loader, test_loader = build_dataloaders(data, device=device)
+    batch_store = build_batch_store(data, train_device=device)
 
     net = build_model(device=device)
 
@@ -1053,7 +944,9 @@ def train() -> None:
     ssr_decay_epochs = int(config.modelconfig.get("ssr_decay_epochs", 30))
     prev_pred_init = str(config.modelconfig.get("prev_pred_init", "ec_base"))
     detach_rollout = bool(config.modelconfig.get("detach_rollout", False))
-    rmse_weight = float(config.modelconfig.get("rmse_weight", 0.1))
+    input_noise_std = float(config.modelconfig.get("input_noise_std", 0.0))
+    rmse_weight = float(config.modelconfig.get("rmse_weight", 0))
+    progress_log_interval = max(1, int(config.modelconfig.get("progress_log_interval", 10)))
 
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
     writer = SummaryWriter(log_dir=config.modelconfig["log_path"])
@@ -1062,7 +955,11 @@ def train() -> None:
         "Train setup:",
         {
             "device": str(device),
-            "batch_size": train_loader.batch_size,
+            "batch_size": batch_store.batch_size,
+            "dataset_storage": str(batch_store.storage_device),
+            "train_samples": batch_store.split_size("train"),
+            "val_samples": batch_store.split_size("val"),
+            "test_samples": batch_store.split_size("test"),
             "epochs": epochs,
             "lr": lr,
             "weight_decay": weight_decay,
@@ -1070,8 +967,8 @@ def train() -> None:
         },
     )
 
-    baseline_val = evaluate_baseline(val_loader, device=device)
-    baseline_test = evaluate_baseline(test_loader, device=device)
+    baseline_val = evaluate_baseline(batch_store, split="val")
+    baseline_test = evaluate_baseline(batch_store, split="test")
     print(format_metric_line("Baseline VAL RMSE", baseline_val["rmse"]))
     print(format_metric_line("Baseline TEST RMSE", baseline_test["rmse"]))
     print(format_metric_line("Baseline VAL ACC", baseline_val["acc"]))
@@ -1080,38 +977,47 @@ def train() -> None:
     best_val_loss = float("inf")
     best_epoch = -1
     stale_epochs = 0
+    train_num_batches = count_split_batches(batch_store, "train")
 
     for epoch in range(epochs):
         net.train()
-        train_losses: List[float] = []
-        train_state = init_metric_state()
+        train_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        train_loss_batches = 0
+        train_state = init_metric_state(device=device)
         skipped_batches = 0
         teacher_forcing_ratio = _ssr_ratio(epoch, ssr_start, ssr_end, ssr_decay_epochs) if autoregressive else 0.0
 
-        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch}")
-        for cond_pcs, seas_anom, ec_base, target, obs_mask, sst_pcs in pbar:
-            cond_pcs = cond_pcs.to(device, non_blocking=True)
-            seas_anom = seas_anom.to(device, non_blocking=True)
-            ec_base = ec_base.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            obs_mask = obs_mask.to(device, non_blocking=True)
-            sst_pcs = sst_pcs.to(device, non_blocking=True)
-            sst_vec = net.encode_sst_pcs(sst_pcs)
+        pbar = tqdm.tqdm(
+            iter_split_batches(batch_store, split="train", shuffle=True),
+            desc=f"Epoch {epoch}",
+            total=train_num_batches,
+            mininterval=1.0,
+        )
+        for batch_idx, batch in enumerate(pbar, start=1):
+            cond = batch["cond"]
+            seas_anom = batch["seas_anom"]
+            ec_base = batch["ec_base"]
+            target = batch["obs_target"]
+            obs_mask = batch["obs_mask"]
+            sst_hist = batch["sst_hist"]
+            if input_noise_std > 0.0:
+                cond = cond + torch.randn_like(cond) * input_noise_std
+                sst_hist = sst_hist + torch.randn_like(sst_hist) * input_noise_std
 
             if autoregressive:
                 pred = autoregressive_rollout(
                     net=net,
-                    cond_pcs=cond_pcs,
+                    cond=cond,
                     seas_anom=seas_anom,
                     ec_base=ec_base,
-                    sst_vec=sst_vec,
+                    sst_hist=sst_hist,
                     target=target,
                     teacher_forcing_ratio=teacher_forcing_ratio,
                     detach_rollout=detach_rollout,
                     prev_pred_init=prev_pred_init,
                 )
             else:
-                pred = net(cond_pcs, seas_anom=seas_anom, ec_base=ec_base, sst_vec=sst_vec)
+                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_hist=sst_hist)
 
             mask2 = obs_mask[:, :, 0] > 0.5
             loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
@@ -1120,8 +1026,8 @@ def train() -> None:
                 skipped_batches += 1
                 continue
 
-            if (not torch.isfinite(pred).all().item()) or (not torch.isfinite(loss).item()):
-                raise FloatingPointError("Non-finite values detected in training.")
+            if not torch.isfinite(loss.detach()).item():
+                raise FloatingPointError("Non-finite loss detected in training.")
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -1129,51 +1035,66 @@ def train() -> None:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
             optimizer.step()
 
-            train_losses.append(float(loss.item()))
+            train_loss_sum = train_loss_sum + loss.detach()
+            train_loss_batches += 1
             update_metrics(train_state, pred.detach(), target[:, :, 0].detach(), mask2.detach())
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}", skipped=skipped_batches)
+            if batch_idx % progress_log_interval == 0 or batch_idx == train_num_batches:
+                avg_loss = (
+                    float((train_loss_sum / train_loss_batches).item())
+                    if train_loss_batches > 0
+                    else float("nan")
+                )
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", skipped=skipped_batches)
 
         train_metrics = finalize_metrics(train_state)
-        train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
+        train_loss = (
+            float((train_loss_sum / train_loss_batches).item())
+            if train_loss_batches > 0
+            else float("inf")
+        )
 
         net.eval()
-        val_losses: List[float] = []
-        val_state = init_metric_state()
-        with torch.no_grad():
-            for cond_pcs, seas_anom, ec_base, target, obs_mask, sst_pcs in val_loader:
-                cond_pcs = cond_pcs.to(device, non_blocking=True)
-                seas_anom = seas_anom.to(device, non_blocking=True)
-                ec_base = ec_base.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
-                obs_mask = obs_mask.to(device, non_blocking=True)
-                sst_pcs = sst_pcs.to(device, non_blocking=True)
-                sst_vec = net.encode_sst_pcs(sst_pcs)
-
+        val_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        val_loss_batches = 0
+        val_state = init_metric_state(device=device)
+        with torch.inference_mode():
+            for batch in iter_split_batches(batch_store, split="val", shuffle=False):
+                cond = batch["cond"]
+                seas_anom = batch["seas_anom"]
+                ec_base = batch["ec_base"]
+                target = batch["obs_target"]
+                obs_mask = batch["obs_mask"]
+                sst_hist = batch["sst_hist"]
                 if autoregressive:
                     pred = autoregressive_rollout(
                         net=net,
-                        cond_pcs=cond_pcs,
+                        cond=cond,
                         seas_anom=seas_anom,
                         ec_base=ec_base,
-                        sst_vec=sst_vec,
+                        sst_hist=sst_hist,
                         target=None,
                         teacher_forcing_ratio=0.0,
                         detach_rollout=True,
                         prev_pred_init=prev_pred_init,
                     )
                 else:
-                    pred = net(cond_pcs, seas_anom=seas_anom, ec_base=ec_base, sst_vec=sst_vec)
+                    pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_hist=sst_hist)
 
                 mask2 = obs_mask[:, :, 0] > 0.5
                 loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
                 if valid_count == 0:
                     continue
-                val_losses.append(float(loss.item()))
+                val_loss_sum = val_loss_sum + loss.detach()
+                val_loss_batches += 1
                 update_metrics(val_state, pred, target[:, :, 0], mask2)
 
         val_metrics = finalize_metrics(val_state)
-        val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        val_loss = (
+            float((val_loss_sum / val_loss_batches).item())
+            if val_loss_batches > 0
+            else float("inf")
+        )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/val", val_loss, epoch)
@@ -1228,42 +1149,46 @@ def train() -> None:
         net.load_state_dict(ckpt["model_state_dict"], strict=False)
 
     net.eval()
-    test_losses: List[float] = []
-    test_state = init_metric_state()
-    with torch.no_grad():
-        for cond_pcs, seas_anom, ec_base, target, obs_mask, sst_pcs in test_loader:
-            cond_pcs = cond_pcs.to(device, non_blocking=True)
-            seas_anom = seas_anom.to(device, non_blocking=True)
-            ec_base = ec_base.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            obs_mask = obs_mask.to(device, non_blocking=True)
-            sst_pcs = sst_pcs.to(device, non_blocking=True)
-            sst_vec = net.encode_sst_pcs(sst_pcs)
-
+    test_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    test_loss_batches = 0
+    test_state = init_metric_state(device=device)
+    with torch.inference_mode():
+        for batch in iter_split_batches(batch_store, split="test", shuffle=False):
+            cond = batch["cond"]
+            seas_anom = batch["seas_anom"]
+            ec_base = batch["ec_base"]
+            target = batch["obs_target"]
+            obs_mask = batch["obs_mask"]
+            sst_hist = batch["sst_hist"]
             if autoregressive:
                 pred = autoregressive_rollout(
                     net=net,
-                    cond_pcs=cond_pcs,
+                    cond=cond,
                     seas_anom=seas_anom,
                     ec_base=ec_base,
-                    sst_vec=sst_vec,
+                    sst_hist=sst_hist,
                     target=None,
                     teacher_forcing_ratio=0.0,
                     detach_rollout=True,
                     prev_pred_init=prev_pred_init,
                 )
             else:
-                pred = net(cond_pcs, seas_anom=seas_anom, ec_base=ec_base, sst_vec=sst_vec)
+                pred = net(cond, seas_anom=seas_anom, ec_base=ec_base, sst_hist=sst_hist)
 
             mask2 = obs_mask[:, :, 0] > 0.5
             loss, valid_count = differentiable_acc_loss(pred, target[:, :, 0], mask2, rmse_weight=rmse_weight)
             if valid_count == 0:
                 continue
-            test_losses.append(float(loss.item()))
+            test_loss_sum = test_loss_sum + loss.detach()
+            test_loss_batches += 1
             update_metrics(test_state, pred, target[:, :, 0], mask2)
 
     test_metrics = finalize_metrics(test_state)
-    test_loss = float(np.mean(test_losses)) if test_losses else float("inf")
+    test_loss = (
+        float((test_loss_sum / test_loss_batches).item())
+        if test_loss_batches > 0
+        else float("inf")
+    )
     print(f"Final TEST loss={test_loss:.5f}")
     print(format_metric_line("TEST RMSE", test_metrics["rmse"]))
     print(format_metric_line("TEST ACC", test_metrics["acc"]))
@@ -1271,7 +1196,6 @@ def train() -> None:
     print(format_metric_line("TEST RMSE Skill (baseline-model)", test_skill))
 
     writer.close()
-
 
 if __name__ == "__main__":
     train()
