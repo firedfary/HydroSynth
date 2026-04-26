@@ -83,26 +83,50 @@ class ConvLSTM(nn.Module):
 
 
 class SPADE(nn.Module):
-    def __init__(self, cond_channels: int, out_channels: int, hidden_channels: int = 16, cond_dropout: float = 0.0):
+    def __init__(
+        self,
+        cond_channels: int,
+        out_channels: int,
+        lead_embed_dim: int,
+        hidden_channels: int = 16,
+        gate_hidden: int = 32,
+        gate_init_bias: float = 4.0,
+        cond_dropout: float = 0.0,
+    ):
         super().__init__()
+        self.cond_channels = cond_channels
+        self.lead_embed_dim = lead_embed_dim
         self.bn = nn.BatchNorm2d(out_channels, affine=False)
         self.cond_drop = nn.Dropout2d(cond_dropout) if cond_dropout > 0.0 else nn.Identity()
-        self.conv_shared = nn.Conv2d(cond_channels, hidden_channels, kernel_size=3, padding=1)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(lead_embed_dim, gate_hidden),
+            nn.GELU(),
+            nn.Linear(gate_hidden, cond_channels),
+        )
+        self.conv_shared = nn.Conv2d(cond_channels + lead_embed_dim, hidden_channels, kernel_size=3, padding=1)
         self.conv_gamma = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1)
         self.conv_beta = nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1)
-        self._zero_init()
+        self._zero_init(gate_init_bias=gate_init_bias)
 
-    def _zero_init(self) -> None:
+    def _zero_init(self, gate_init_bias: float = 4.0) -> None:
+        gate_out = self.gate_mlp[-1]
+        nn.init.zeros_(gate_out.weight)
+        nn.init.constant_(gate_out.bias, gate_init_bias)
         nn.init.zeros_(self.conv_gamma.weight)
         nn.init.zeros_(self.conv_gamma.bias)
         nn.init.zeros_(self.conv_beta.weight)
         nn.init.zeros_(self.conv_beta.bias)
 
-    def forward(self, x: torch.Tensor, cond_map: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond_map: torch.Tensor, lead_emb: torch.Tensor) -> torch.Tensor:
         if cond_map.shape[-2:] != x.shape[-2:]:
             cond_map = F.adaptive_avg_pool2d(cond_map, x.shape[-2:])
-        cond_map = self.cond_drop(cond_map)
-        h = self.conv_shared(cond_map)
+
+        gate = torch.sigmoid(self.gate_mlp(lead_emb)).view(lead_emb.shape[0], self.cond_channels, 1, 1)
+        gated_cond = self.cond_drop(cond_map * gate)
+        lead_map = lead_emb[:, :, None, None].expand(-1, -1, x.shape[-2], x.shape[-1])
+        fused_cond = torch.cat([gated_cond, lead_map], dim=1)
+
+        h = self.conv_shared(fused_cond)
         gamma = self.conv_gamma(h)
         beta = self.conv_beta(h)
         return self.bn(x) * (1.0 + gamma) + beta
@@ -114,6 +138,12 @@ class Seas2RainModel(nn.Module):
         cond_channels: int = 7,
         sst_hist_channels: int = 12,
         spade_hidden: int = 16,
+        lead_embed_dim: int = 8,
+        lead_gate_hidden: int = 32,
+        lead_gate_init_bias: float = 4.0,
+        enc_spade1_hidden: Optional[int] = None,
+        enc_spade2_hidden: Optional[int] = None,
+        dec_spade_hidden: Optional[int] = None,
         dropout: float = 0.1,
         cond_dropout: float = 0.1,
         hidden_dim: int = 64,
@@ -129,6 +159,10 @@ class Seas2RainModel(nn.Module):
         self.cond_channels = cond_channels
         self.sst_hist_channels = sst_hist_channels
         self.spade_hidden = spade_hidden
+        self.num_leads = 6
+        self.lead_embed_dim = lead_embed_dim
+        self.lead_gate_hidden = lead_gate_hidden
+        self.lead_gate_init_bias = lead_gate_init_bias
         self.dropout = dropout
         self.cond_dropout = cond_dropout
         self.hidden_dim = hidden_dim
@@ -136,22 +170,53 @@ class Seas2RainModel(nn.Module):
         self.ps_scale = ps_scale
 
         cond_in_ch = cond_channels + sst_hist_channels
+        enc_spade1_hidden = spade_hidden if enc_spade1_hidden is None else enc_spade1_hidden
+        enc_spade2_hidden = spade_hidden if enc_spade2_hidden is None else enc_spade2_hidden
+        dec_spade_hidden = spade_hidden if dec_spade_hidden is None else dec_spade_hidden
+        self.enc_spade1_hidden = enc_spade1_hidden
+        self.enc_spade2_hidden = enc_spade2_hidden
+        self.dec_spade_hidden = dec_spade_hidden
+        self.lead_embedding = nn.Embedding(self.num_leads, lead_embed_dim)
 
         in_ch = 2  # seas_anom + prev_pred
 
         self.enc_conv1 = nn.Conv2d(in_ch, encoder_channels, kernel_size=3, stride=2, padding=1)
-        self.enc_spade1 = SPADE(cond_in_ch, encoder_channels, hidden_channels=spade_hidden, cond_dropout=cond_dropout)
+        self.enc_spade1 = SPADE(
+            cond_in_ch,
+            encoder_channels,
+            lead_embed_dim=lead_embed_dim,
+            hidden_channels=enc_spade1_hidden,
+            gate_hidden=lead_gate_hidden,
+            gate_init_bias=lead_gate_init_bias,
+            cond_dropout=cond_dropout,
+        )
         self.enc_drop1 = nn.Dropout2d(dropout)
 
         self.enc_conv2 = nn.Conv2d(encoder_channels, hidden_dim, kernel_size=3, padding=1)
-        self.enc_spade2 = SPADE(cond_in_ch, hidden_dim, hidden_channels=spade_hidden, cond_dropout=cond_dropout)
+        self.enc_spade2 = SPADE(
+            cond_in_ch,
+            hidden_dim,
+            lead_embed_dim=lead_embed_dim,
+            hidden_channels=enc_spade2_hidden,
+            gate_hidden=lead_gate_hidden,
+            gate_init_bias=lead_gate_init_bias,
+            cond_dropout=cond_dropout,
+        )
         self.enc_drop2 = nn.Dropout2d(dropout)
 
         self.convlstm = ConvLSTM(input_dim=hidden_dim, hidden_dim=hidden_dim, num_layers=num_layers)
 
         self.up_conv = nn.Conv2d(hidden_dim, decoder_channels * (ps_scale ** 2), kernel_size=3, padding=1)
         self.pixel_shuffle = nn.PixelShuffle(ps_scale)
-        self.dec_spade = SPADE(cond_in_ch, decoder_channels, hidden_channels=spade_hidden, cond_dropout=cond_dropout)
+        self.dec_spade = SPADE(
+            cond_in_ch,
+            decoder_channels,
+            lead_embed_dim=lead_embed_dim,
+            hidden_channels=dec_spade_hidden,
+            gate_hidden=lead_gate_hidden,
+            gate_init_bias=lead_gate_init_bias,
+            cond_dropout=cond_dropout,
+        )
         self.dec_drop = nn.Dropout2d(dropout)
         self.out_conv = nn.Conv2d(decoder_channels, 1, kernel_size=3, padding=1)
 
@@ -168,7 +233,7 @@ class Seas2RainModel(nn.Module):
     def _zero_spade(self) -> None:
         for module in self.modules():
             if isinstance(module, SPADE):
-                module._zero_init()
+                module._zero_init(gate_init_bias=self.lead_gate_init_bias)
 
     def init_state(
         self,
@@ -207,6 +272,7 @@ class Seas2RainModel(nn.Module):
         ec_base_t: torch.Tensor,
         prev_pred: torch.Tensor,
         sst_hist: torch.Tensor,
+        lead_idx: torch.Tensor,
         state: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         # cond_t: [B, 7, Hc, Wc]
@@ -217,15 +283,16 @@ class Seas2RainModel(nn.Module):
 
         target_hw = seas_anom_t.shape[-2:]
         cond_map = self._build_cond_map(cond_t, sst_hist, target_hw)
+        lead_emb = self.lead_embedding(lead_idx)
 
         x = torch.cat([seas_anom_t, prev_pred], dim=1)
         x = self.enc_conv1(x)
-        x = self.enc_spade1(x, cond_map)
+        x = self.enc_spade1(x, cond_map, lead_emb)
         x = F.gelu(x)
         x = self.enc_drop1(x)
 
         x = self.enc_conv2(x)
-        x = self.enc_spade2(x, cond_map)
+        x = self.enc_spade2(x, cond_map, lead_emb)
         x = F.gelu(x)
         x = self.enc_drop2(x)
 
@@ -236,7 +303,7 @@ class Seas2RainModel(nn.Module):
         h, state = self.convlstm(x, state)
         y = self.up_conv(h)
         y = self.pixel_shuffle(y)
-        y = self.dec_spade(y, cond_map)
+        y = self.dec_spade(y, cond_map, lead_emb)
         y = F.gelu(y)
         y = self.dec_drop(y)
         delta = self.out_conv(y).squeeze(1)
@@ -277,12 +344,14 @@ class Seas2RainModel(nn.Module):
                 prev_in = prev_seq[:, t]
             else:
                 prev_in = prev
+            lead_idx = torch.full((bsz,), t, device=cond.device, dtype=torch.long)
             pred_t, state = self.forward_step(
                 cond_t=cond[:, t],
                 seas_anom_t=seas_anom[:, t],
                 ec_base_t=ec_base[:, t],
                 prev_pred=prev_in,
                 sst_hist=sst_hist,
+                lead_idx=lead_idx,
                 state=state,
             )
             preds.append(pred_t)

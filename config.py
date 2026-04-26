@@ -55,7 +55,7 @@ modelconfig = {
     # "channel_mult": [2, 4, 4, 2],
     # "atten": [0, 1, 2, 3],
     # "num_res_block": 6,
-    # "dropout": 0.6,
+    "dropout": 0.6,
     "save_weight_path": save_weight_path,
     "train_load_weight": None,
     "eval_load_weight": "ckptunet_1.pt",
@@ -92,6 +92,11 @@ modelconfig = {
     "prev_pred_init": "ec_base",
     "detach_rollout": False,
     "spade_hidden": 256,
+    "enc_spade1_hidden": 64,
+    "enc_spade2_hidden": 1024,
+    "dec_spade_hidden": 1024,
+    "lead_gate_hidden": 256,
+    "lead_gate_init_bias": 4.0,
 }
 
 

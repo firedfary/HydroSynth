@@ -732,6 +732,12 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
     encoder_channels = int(cfg.get("seas2rain_encoder_channels", 64))
     ps_scale = int(cfg.get("seas2rain_ps_scale", 2))
     spade_hidden = int(cfg.get("spade_hidden", 16))
+    lead_embed_dim = int(cfg.get("lead_embed_dim", 8))
+    lead_gate_hidden = int(cfg.get("lead_gate_hidden", max(lead_embed_dim, 32)))
+    lead_gate_init_bias = float(cfg.get("lead_gate_init_bias", 4.0))
+    enc_spade1_hidden = int(cfg.get("enc_spade1_hidden", spade_hidden))
+    enc_spade2_hidden = int(cfg.get("enc_spade2_hidden", spade_hidden))
+    dec_spade_hidden = int(cfg.get("dec_spade_hidden", spade_hidden))
     sst_window = int(cfg.get("sst_window", 12))
     dropout = float(cfg.get("dropout", 0.5))
     cond_dropout = float(cfg.get("cond_dropout", 0.5))
@@ -740,6 +746,12 @@ def build_model(device: torch.device) -> model.Seas2RainModel:
         cond_channels=len(COND_VARS),
         sst_hist_channels=sst_window,
         spade_hidden=spade_hidden,
+        lead_embed_dim=lead_embed_dim,
+        lead_gate_hidden=lead_gate_hidden,
+        lead_gate_init_bias=lead_gate_init_bias,
+        enc_spade1_hidden=enc_spade1_hidden,
+        enc_spade2_hidden=enc_spade2_hidden,
+        dec_spade_hidden=dec_spade_hidden,
         dropout=dropout,
         cond_dropout=cond_dropout,
         hidden_dim=hidden_dim,
@@ -794,6 +806,7 @@ def autoregressive_rollout(
                 prev_in = torch.where(use_teacher[:, None, None], target[:, t - 1, 0], prev_pred)
             else:
                 prev_in = prev_pred
+        lead_idx = torch.full((bsz,), t, device=cond.device, dtype=torch.long)
 
         pred_t, state = net.forward_step(
             cond_t=cond[:, t],
@@ -801,6 +814,7 @@ def autoregressive_rollout(
             ec_base_t=ec_base[:, t],
             prev_pred=prev_in,
             sst_hist=sst_hist,
+            lead_idx=lead_idx,
             state=state,
         )
         preds.append(pred_t)
