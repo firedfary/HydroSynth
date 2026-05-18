@@ -135,7 +135,7 @@ class SPADE(nn.Module):
 class Seas2RainModel(nn.Module):
     def __init__(
         self,
-        cond_channels: int = 7,
+        cond_channels: int = 2,
         sst_hist_channels: int = 12,
         spade_hidden: int = 16,
         lead_embed_dim: int = 8,
@@ -275,7 +275,7 @@ class Seas2RainModel(nn.Module):
         lead_idx: torch.Tensor,
         state: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
-        # cond_t: [B, 7, Hc, Wc]
+        # cond_t: [B, 2, Hc, Wc]
         # seas_anom_t/ec_base_t: [B, 1, 60, 70]
         # prev_pred: [B, 60, 70] or [B, 1, 60, 70]
         if prev_pred.dim() == 3:
@@ -319,7 +319,7 @@ class Seas2RainModel(nn.Module):
         sst_hist: torch.Tensor,
         prev_pred: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # cond: [B, T, 7, Hc, Wc]
+        # cond: [B, T, 2, Hc, Wc]
         bsz, tdim = cond.shape[0], cond.shape[1]
         preds: List[torch.Tensor] = []
 

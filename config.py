@@ -15,7 +15,7 @@ save_weight_foldr = "weight_t0"
 picture_foldr = "picture"
 log_foldr = "log_ind"
 
-local_data_path = "d:/workplace/conv_data/"
+local_data_path = "d:/workplace/unet_data/"
 colab_data_path = "/content/drive/MyDrive/my_models/my_model_data/"
 
 
@@ -85,7 +85,7 @@ modelconfig = {
     "save_every": 5,
     "patience": 12,
     "early_stop_min_delta": 0.0001,
-    "autoregressive": True,
+    "autoregressive": False,
     "ssr_start": 1.0,
     "ssr_end": 0.0,
     "ssr_decay_epochs": 300,

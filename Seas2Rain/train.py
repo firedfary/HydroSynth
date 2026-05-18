@@ -1,4 +1,4 @@
-﻿import os
+import os
 import glob
 import random
 import re
@@ -32,8 +32,13 @@ except Exception:
 config.enable_auto_create_folders()
 
 LEADS = 6
-COND_VARS = ["h500", "slp", "t2m", "t850", "u850", "v850", "sst"]
+COND_VARS = ["h500", "slp"]
 TARGET_HW = (60, 70)
+MODES_CACHE_VERSION = "20260504_cond_h500_slp_ranges_v1"
+
+
+def _cond_vars_signature() -> str:
+    return "_".join(COND_VARS)
 BATCH_KEYS = ("cond", "seas_anom", "ec_base", "obs_target", "obs_mask", "sst_hist")
 
 def set_seed(seed: int) -> None:
@@ -81,13 +86,6 @@ def _parse_date_from_path(path: str) -> Optional[pd.Timestamp]:
     month = int(yyyymm[4:])
     return pd.Timestamp(year=year, month=month, day=1)
 
-def _sel_region(ds: xr.Dataset) -> xr.Dataset:
-    if "longitude" in ds.coords and "latitude" in ds.coords:
-        return ds.sel(longitude=slice(70, 140), latitude=slice(60, 0))
-    if "lon" in ds.coords and "lat" in ds.coords:
-        return ds.sel(lon=slice(70, 140), lat=slice(60, 0))
-    return ds
-
 def _get_lat_lon(ds: xr.Dataset) -> Tuple[np.ndarray, np.ndarray]:
     if "latitude" in ds.coords:
         lat = ds.coords["latitude"].to_numpy()
@@ -130,7 +128,27 @@ def read_modes_data(
         init_dates = pd.to_datetime(cached["init_dates"].astype(str))
         grid_lats = cached["grid_lats"].astype(np.float32)
         grid_lons = cached["grid_lons"].astype(np.float32)
-        return tp_raw, cond_raw, pd.DatetimeIndex(init_dates), grid_lats, grid_lons
+        cached_cond_vars = cached["cond_vars"].tolist() if "cond_vars" in cached.files else None
+        cached_version = str(cached["cache_version"]) if "cache_version" in cached.files else None
+
+        cache_valid = (
+            cond_raw.ndim == 5
+            and cond_raw.shape[2] == len(COND_VARS)
+            and tp_raw.shape[-2:] == target_hw
+            and tuple(grid_lats.shape) == (target_hw[0],)
+            and tuple(grid_lons.shape) == (target_hw[1],)
+            and cached_cond_vars == COND_VARS
+            and cached_version == MODES_CACHE_VERSION
+        )
+        if cache_valid:
+            return tp_raw, cond_raw, pd.DatetimeIndex(init_dates), grid_lats, grid_lons
+
+        print(
+            f"Ignore stale MODES cache: {cache_path}. "
+            f"cond_channels={cond_raw.shape[2] if cond_raw.ndim == 5 else 'invalid'}, "
+            f"expected={len(COND_VARS)}, cache_version={cached_version}, "
+            f"cond_vars={cached_cond_vars}"
+        )
 
     file_list = utils.read_nc_to_npy(199401, 202409, data_path=seas_nc_path or "D:\\MODESv21_ecmwf_seas51")# 读取SERS5模式数据
 
@@ -148,32 +166,39 @@ def read_modes_data(
             continue
         try:
             with xr.open_dataset(f) as ds:
-                ds_tp = _sel_region(ds)
-                tp = ds_tp[["tp"]]
-                cond = ds[COND_VARS]
+                # Coordinate names standardization
+                if "longitude" in ds.coords: ds = ds.rename({"longitude": "lon", "latitude": "lat"})
 
-                tp_arr = tp.to_array().to_numpy().astype(np.float32)  # [1, L, H, W]
-                cond_arr = cond.to_array().to_numpy().astype(np.float32)  # [7, L, H, W]
+                # Precipitation range: lon=70-140, lat=60-0
+                tp_ds = ds[["tp"]].sel(lon=slice(70, 140), lat=slice(60, 0))
+                
+                lat, lon = _get_lat_lon(tp_ds)
+                if grid_lats is None or grid_lons is None:
+                    grid_lats, grid_lons = _build_target_grid(lat, lon, target_hw)
+
+                tp_arr = tp_ds.interp(lat=grid_lats, lon=grid_lons, method="linear").to_array().to_numpy().astype(np.float32) # [1, L, H, W]
+
+                # Condition variables ranges
+                # h500: lon=70-180, lat=60--30
+                # slp: lon=60-180, lat=60-0
+                h500_ds = ds[["h500"]].sel(lon=slice(70, 180), lat=slice(60, -30))
+                slp_ds = ds[["slp"]].sel(lon=slice(60, 180), lat=slice(60, 0))
+
+                h500_interp = h500_ds.interp(lat=grid_lats, lon=grid_lons, method="linear")["h500"].to_numpy()
+                slp_interp = slp_ds.interp(lat=grid_lats, lon=grid_lons, method="linear")["slp"].to_numpy()
+
+                cond_arr = np.stack([h500_interp, slp_interp], axis=0).astype(np.float32) # [2, L, H, W]
 
                 if tp_arr.shape[1] != LEADS:
                     raise ValueError(f"tp lead mismatch: expected {LEADS}, got {tp_arr.shape[1]}")
                 if cond_arr.shape[1] != LEADS:
                     raise ValueError(f"cond lead mismatch: expected {LEADS}, got {cond_arr.shape[1]}")
 
-                lat, lon = _get_lat_lon(tp)
-                if grid_lats is None or grid_lons is None:
-                    grid_lats, grid_lons = _build_target_grid(lat, lon, target_hw)
-
-                if tp_arr.shape[-2:] != target_hw:
-                    raise ValueError(
-                        f"tp spatial shape mismatch: expected {target_hw}, got {tp_arr.shape[-2:]}"
-                    )
-
                 tp_arr = np.nan_to_num(tp_arr, nan=0.0, posinf=0.0, neginf=0.0)
                 cond_arr = np.nan_to_num(cond_arr, nan=0.0, posinf=0.0, neginf=0.0)
 
                 tp_list.append(tp_arr.squeeze(0))  # [L, H, W]
-                cond_list.append(cond_arr)  # [7, L, H, W]
+                cond_list.append(cond_arr)  # [2, L, H, W]
                 date_list.append(date)
         except Exception as e:
             print(f"Skip file {f}: {e}")
@@ -183,8 +208,8 @@ def read_modes_data(
         raise RuntimeError("No valid MODESv21 files found.")
 
     tp_raw = np.stack(tp_list, axis=0)  # [N, L, H, W]
-    cond_raw = np.stack(cond_list, axis=0)  # [N, 7, L, H, W]
-    cond_raw = np.transpose(cond_raw, (0, 2, 1, 3, 4))  # [N, L, 7, H, W]
+    cond_raw = np.stack(cond_list, axis=0)  # [N, 2, L, H, W]
+    cond_raw = np.transpose(cond_raw, (0, 2, 1, 3, 4))  # [N, L, 2, H, W]
 
     init_dates = pd.DatetimeIndex(date_list)
 
@@ -196,6 +221,8 @@ def read_modes_data(
         init_dates=np.array([d.strftime("%Y-%m-%d") for d in init_dates]),
         grid_lats=grid_lats.astype(np.float32),
         grid_lons=grid_lons.astype(np.float32),
+        cond_vars=np.array(COND_VARS, dtype="<U32"),
+        cache_version=np.array(MODES_CACHE_VERSION),
     )
     return tp_raw.astype(np.float32), cond_raw.astype(np.float32), init_dates, grid_lats, grid_lons
 
@@ -235,7 +262,12 @@ def read_ersst_data(
             with xr.open_dataset(f) as ds:
                 if "ssta" not in ds:
                     raise KeyError("ssta not found in ERSST file")
-                arr = np.asarray(ds["ssta"].to_numpy())
+                
+                # SST range: lon=160-210, lat=10--10
+                if "longitude" in ds.coords: ds = ds.rename({"longitude": "lon", "latitude": "lat"})
+                ds_ssta = ds.sel(lon=slice(160, 210), lat=slice(10, -10))
+
+                arr = np.asarray(ds_ssta["ssta"].to_numpy())
                 if arr.ndim == 4:
                     # Expected (time=1, zlev=1, lat, lon)
                     if arr.shape[0] != 1 or arr.shape[1] != 1:
@@ -354,10 +386,12 @@ def calc_precip_percent_anomaly(
     return pa, climatology
 
 def compute_cond_stats(cond_raw: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    # cond_raw: [N, L, 7, H, W]
-    sum_x = np.zeros((LEADS, len(COND_VARS)), dtype=np.float64)
-    sum_x2 = np.zeros((LEADS, len(COND_VARS)), dtype=np.float64)
-    count = np.zeros((LEADS, len(COND_VARS)), dtype=np.float64)
+    # cond_raw: [N, L, C, H, W]
+    lead_dim = cond_raw.shape[1]
+    cond_dim = cond_raw.shape[2]
+    sum_x = np.zeros((lead_dim, cond_dim), dtype=np.float64)
+    sum_x2 = np.zeros((lead_dim, cond_dim), dtype=np.float64)
+    count = np.zeros((lead_dim, cond_dim), dtype=np.float64)
 
     for idx in tqdm.tqdm(train_idx, desc="Cond stats"):
         x = cond_raw[int(idx)].astype(np.float32)  # [L, 7, H, W]
@@ -376,7 +410,7 @@ def compute_cond_stats(cond_raw: np.ndarray, train_idx: np.ndarray) -> Tuple[np.
     return mean.astype(np.float32), std.astype(np.float32)
 
 def normalize_cond(cond_raw: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    # cond_raw: [N, L, 7, H, W], mean/std: [L, 7]
+    # cond_raw: [N, L, C, H, W], mean/std: [L, C]
     x = (cond_raw - mean[None, :, :, None, None]) / std[None, :, :, None, None]
     x = np.clip(x, -6.0, 6.0)
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -482,7 +516,8 @@ def prepare_data() -> Dict[str, np.ndarray]:
     cache_dir = cfg.get("seas2rain_cache_dir", os.path.join(cfg["lr_path"], "seas2rain_cache"))
     os.makedirs(cache_dir, exist_ok=True)
 
-    modes_cache = os.path.join(cache_dir, "modes_tp_cond_60x70.npz")
+    cond_cache_tag = _cond_vars_signature()
+    modes_cache = os.path.join(cache_dir, f"modes_tp_cond_60x70_{cond_cache_tag}.npz")
     seas_nc_path = cfg.get("seas_nc_path")
     tp_unit_scale = float(cfg.get("tp_unit_scale", 1.0))
 
@@ -532,7 +567,10 @@ def prepare_data() -> Dict[str, np.ndarray]:
     seas_anom = seas_anom[:, :, None, :, :].astype(np.float32)
 
     cond_mean, cond_std = compute_cond_stats(cond_raw=cond_raw, train_idx=splits["train"])
-    cond_norm_cache = os.path.join(cache_dir, f"cond_norm_n{len(init_dates)}.npy")
+    cond_norm_cache = os.path.join(
+        cache_dir,
+        f"cond_norm_{cond_cache_tag}_{MODES_CACHE_VERSION}_n{len(init_dates)}.npy",
+    )
     if os.path.exists(cond_norm_cache):
         cond_norm = np.load(cond_norm_cache).astype(np.float32)
         if cond_norm.shape != cond_raw.shape:
