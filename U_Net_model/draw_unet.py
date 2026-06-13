@@ -1,14 +1,20 @@
 import torch
 import os
+import sys
+
+_curr_file = os.path.abspath(__file__)
+_proj_root = os.path.dirname(os.path.dirname(_curr_file))
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
 import warmup_scheduler
 import tqdm
 import numpy as np
-import fucs
+import utils
 import config
 # from torch.utils.tensorboard import SummaryWriter
 from unetlite import UNetLite
 from unet_model import UNet
-from fucs import save_image
+from utils.utils import save_image
 import matplotlib.pyplot as plt
 import pandas as pd
 from scipy.stats import pearsonr
@@ -68,7 +74,7 @@ with torch.no_grad():
 
 output_all = torch.cat(output_list, dim=0)
 x0_all = torch.cat(x0_list, dim=0)
-acc = fucs.cal_acc(torch.tensor(x0_all).squeeze(1), torch.tensor(output_all).squeeze(1))
+acc = utils.utils.cal_acc(torch.tensor(x0_all).squeeze(1), torch.tensor(output_all).squeeze(1))
 print(acc[0:345].mean(),acc[345:366].mean())
 
 from torchviz import make_dot
