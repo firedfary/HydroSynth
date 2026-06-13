@@ -15,7 +15,7 @@ save_weight_foldr = "weight_t0"
 picture_foldr = "picture"
 log_foldr = "log_ind"
 
-local_data_path = "d:/workplace/unet_data/"
+local_data_path = "d:/workplace/unet3_repair_copyfrom/"
 colab_data_path = "/content/drive/MyDrive/my_models/my_model_data/"
 
 
@@ -49,20 +49,20 @@ RUN_ID_TIME_FORMAT = "%Y%m%d_%H%M%S"
 
 modelconfig = {
     "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 16,
+    "batch_size": 8,
     # "T": 200,
     "channels": [32, 64, 128, 256],
     # "channel_mult": [2, 4, 4, 2],
     # "atten": [0, 1, 2, 3],
     # "num_res_block": 6,
-    "dropout": 0.6,
+    "dropout": 0.2,
     "save_weight_path": save_weight_path,
     "train_load_weight": None,
     "eval_load_weight": "ckptunet_1.pt",
     "picture_save_path": picture_save_path,
     "log_path": log_path,
-    "lr": 0.00001,
-    "epoch": 1002,
+    "lr": 0.0001,
+    "epoch": 160,
     # "multiplier": 1.0,
     # "bata_1": 0.0001,
     # "bata_T": 0.02,
@@ -74,13 +74,14 @@ modelconfig = {
     # "test_ratio": 0.2,
     "seed": 42,
     "n_pcs": 5,
-    # "pc_window": 1,
-    # "pc_step": 1,
+    "pc_window": 1,
+    "pc_step": 1,
     # "horizon": 6,
     "num_workers": 0,
     "lead_embed_dim": 8,
     "global_dim": 128,
-    "weight_decay": 0.0001,
+    "seas2rain_hidden_dim": 64,
+    "weight_decay": 0.01,
     # "grad_accum": 1,
     "save_every": 5,
     "patience": 12,
@@ -118,21 +119,22 @@ def _sanitize_run_id(user_run_id: str) -> str:
 
 def _get_run_id_from_user() -> str:
     try:
-        user_run_id = input("Enter run_id (leave blank to use timestamp): ").strip()
+        user_run_id = input("Enter run label (leave blank to use timestamp only): ").strip()
     except EOFError:
         user_run_id = ""
 
+    timestamp = _default_run_id()
     if not user_run_id:
-        return _default_run_id()
+        return timestamp
 
     sanitized_run_id = _sanitize_run_id(user_run_id)
     if not sanitized_run_id:
-        return _default_run_id()
+        return timestamp
 
     if sanitized_run_id != user_run_id:
-        print(f"Invalid path characters were replaced. Using run_id: {sanitized_run_id}")
+        print(f"Invalid path characters were replaced. Using run label: {sanitized_run_id}")
 
-    return sanitized_run_id
+    return f"{timestamp}_{sanitized_run_id}"
 
 
 def enable_auto_create_folders(enable: bool = True):

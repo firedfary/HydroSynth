@@ -12,7 +12,7 @@ from fucs import save_image
 import matplotlib.pyplot as plt
 import pandas as pd
 from scipy.stats import pearsonr
-import HydroSynth.process.observe_norm as observe_norm
+import utils.observe_norm as observe_norm
 from unetlitefilm import UNetLiteFiLM
 from Unet2 import prepare_data as prepare_data2
 from Unet3 import prepare_data as prepare_data3

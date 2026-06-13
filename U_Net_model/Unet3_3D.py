@@ -54,7 +54,7 @@ def compute_pcs_from_sst(sst, n_pcs=3, window=1, step=1):
         X = sst[:,t].reshape(B, -1)
         X[~np.isfinite(X)] = 0.0
 
-        pca = PCA(n_components=n_pcs)
+        pca = PCA(n_components=n_pcs, svd_solver='full')
         pcs = pca.fit_transform(X)  # [T, n_pcs]
         pcs = (pcs - pcs.mean(0, keepdims=True)) / (pcs.std(0, keepdims=True) + 1e-8)
         eof_patterns = pca.components_.reshape(n_pcs, H, W)

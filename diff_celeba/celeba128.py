@@ -51,13 +51,13 @@ def create_celeba_unet():
 
 # --- 1. 配置参数 ---
 class Config:
-    dataset_path = r"E:\HydroSynth\datas\data128" # 你的数据集路径
+    dataset_path = r"D:\workplace\diff_celeba\data128" # 你的数据集路径
     output_dir = 'D:\workplace\diff_celeba\weight'      #
-    resume_from = "D:\\workplace\\diff_celeba\\weight\\checkpoint-4"
+    resume_from = "D:\\workplace\\diff_celeba\\weight\\checkpoint-49"
     image_size = 128
     train_batch_size = 16  # T4 建议 16，若显存够可加到 32
     eval_batch_size = 4    # 测试时生成的图片数量
-    num_epochs = 50        # 根据需要调整
+    num_epochs = 500        # 根据需要调整
     gradient_accumulation_steps = 1
     learning_rate = 1e-4   # 你询问的推荐学习率
     lr_warmup_steps = 500

@@ -10,12 +10,11 @@ import tqdm
 import numpy as np
 from HydroSynth.utils import utils
 import config
-config.auto_save_config()
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.decomposition import PCA
 from unetlitefilm import UNetLiteFiLM
-
+config.enable_auto_create_folders(True)
 
 def compute_pcs_from_sst(sst_path, n_pcs=3, window=1, step=1):
     """
@@ -35,7 +34,7 @@ def compute_pcs_from_sst(sst_path, n_pcs=3, window=1, step=1):
     X = sst_anom.reshape(T, -1)
     X[~np.isfinite(X)] = 0.0
 
-    pca = PCA(n_components=n_pcs)
+    pca = PCA(n_components=n_pcs, svd_solver='full')
     pcs = pca.fit_transform(X)  # [T, n_pcs]
     pcs = (pcs - pcs.mean(0, keepdims=True)) / (pcs.std(0, keepdims=True) + 1e-8)
     eof_patterns = pca.components_.reshape(n_pcs, H, W)
@@ -62,7 +61,7 @@ def prepare_data():
     mask_t = torch.isnan(target_t)
 
     # --- condition (10-channel climate fields) ---
-    cond_file = config.modelconfig["lr_path"] + "/lr_data1.npy"
+    cond_file = config.modelconfig["lr_path"] + "/lr_data_reconstructed2.npy"
     cond = np.load(cond_file).astype(np.float32)  # [T,C,H,W]
     # if cond.ndim == 5:
     #     Tdim = cond.shape[0]

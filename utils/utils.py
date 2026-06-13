@@ -15,7 +15,7 @@ import matplotlib
 from matplotlib import ticker
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from typing import List, Optional
+from typing import List, Optional, Union
 import os
 import torch
 import matplotlib as mpl
@@ -316,11 +316,11 @@ def read_nc_to_npy(start: int, end: int, data_path: str = "D:\MODESv21_ecmwf_sea
 
 
 
-def save_image(*tensors: torch.Tensor, 
+def save_image(*tensors: Union[torch.Tensor, np.ndarray], 
                names: Optional[List[str]] = None,
                ncols: int = 2,
                path: Optional[str] = None,
-               show: bool = False,
+               show: bool = True,
                figsize: tuple = (10, 9),
                filename: str = 'image.svg'):
     num_images = len(tensors)
@@ -341,14 +341,21 @@ def save_image(*tensors: torch.Tensor,
     fig, axs = plt.subplots(nrows, ncols, figsize=figsize)
     axs = np.array(axs).flatten()  # 强制转换为一维数组
 
-    # 遍历处理每个张量
+    # 遍历处理每个张量/数组
     for idx, (tensor, name) in enumerate(zip(tensors, names)):
         ax = axs[idx]
         
-        # 处理张量维度
-        array = tensor.cpu().detach().numpy()
+        # 处理张量或numpy数组
+        if isinstance(tensor, torch.Tensor):
+            array = tensor.cpu().detach().numpy()
+        elif isinstance(tensor, np.ndarray):
+            array = tensor
+        else:
+            raise TypeError(f"不支持的输入类型: {type(tensor)}")
+        
+        # 自动降维
         if array.ndim > 2:
-            array = array[(0,) * (array.ndim - 2)]  # 自动降维
+            array = array[(0,) * (array.ndim - 2)]
         
         # 绘制图像
         im = ax.imshow(array)
