@@ -54,7 +54,7 @@ def compute_pcs_from_sst(sst_path, n_pcs=3, window=1, step=1):
 def prepare_data():
     """Load target, condition, and indices (PCs). Return TensorDatasets."""
     # --- target (precip) ---
-    target_file = config.modelconfig["hr_path"] + "/hr_data1.npy"
+    target_file = config.modelconfig["hr_path"] + "/hr_data.npy"
     target = np.load(target_file).astype(np.float32)  # [T,H,W]
     target = np.expand_dims(target, 1)  # [T,1,H,W]
     target_t = torch.from_numpy(target)
@@ -100,15 +100,17 @@ def prepare_data():
 
 def train():
     device = torch.device(config.modelconfig["device"])
+    print(f"Training device: {device}")
     train_set, test_set = prepare_data()
+    pin_memory = device.type == "cuda"
 
     train_loader = DataLoader(
         train_set, batch_size=config.modelconfig["batch_size"],
-        shuffle=True, num_workers=0, pin_memory=True, drop_last=True
+        shuffle=True, num_workers=0, pin_memory=pin_memory, drop_last=True
     )
     test_loader = DataLoader(
         test_set, batch_size=config.modelconfig["batch_size"],
-        shuffle=False, num_workers=0, pin_memory=True
+        shuffle=False, num_workers=0, pin_memory=pin_memory
     )
 
     input_channels = train_set[0][1].shape[0]  # condition channels

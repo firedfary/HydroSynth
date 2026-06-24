@@ -65,6 +65,17 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _resolve_device() -> torch.device:
+    preferred_device = os.getenv("HYDROSYNTH_DEVICE")
+    if preferred_device:
+        return torch.device(preferred_device)
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 base_data_path = _resolve_base_path()
 
 lr_path = os.path.join(base_data_path, lr_foldr)
@@ -82,7 +93,7 @@ run_id = "default"
 RUN_ID_TIME_FORMAT = "%Y%m%d_%H%M%S"
 
 modelconfig = {
-    "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+    "device": _resolve_device(),
     "batch_size": 8,
     # "T": 200,
     "channels": [32, 64, 128, 256],
@@ -95,6 +106,7 @@ modelconfig = {
     "eval_load_weight": "ckptunet_1.pt",
     "picture_save_path": picture_save_path,
     "log_path": log_path,
+    "base_data_path": base_data_path,
     "lr": 0.0001,
     "epoch": 160,
     # "multiplier": 1.0,
@@ -104,7 +116,6 @@ modelconfig = {
     "lr_path": lr_path,
     "hr_path": hr_path,
     "sst_file": sst_file,
-    "modesv21_data_path": os.getenv("MODESV21_DATA_PATH"),
     # "cond_dim": 10,
     # "test_ratio": 0.2,
     "seed": 42,
