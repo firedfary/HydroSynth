@@ -128,7 +128,7 @@ def read_modes_data(cache_path: str, target_hw: Tuple[int, int] = TARGET_HW, sea
             and cached_cond_vars == COND_VARS and cached_version == MODES_CACHE_VERSION):
             return tp_raw, cond_raw, pd.DatetimeIndex(init_dates), grid_lats, grid_lons
 
-    file_list = utils.read_nc_to_npy(199401, 202409, data_path=seas_nc_path or "D:\\MODESv21_ecmwf_seas51")
+    file_list = utils.read_nc_to_npy(199401, 202409, data_path=seas_nc_path)
     tp_list, cond_list, date_list = [], [], []
     grid_lats, grid_lons = None, None
     forbidden = {pd.Timestamp("2011-09-01"), pd.Timestamp("2011-10-01")}

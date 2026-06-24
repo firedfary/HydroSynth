@@ -2,12 +2,46 @@ import json
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 
 import torch
 
 
 # Default behavior: do not create timestamped run folders on import.
 AUTO_CREATE_FOLDERS_ON_IMPORT = False
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
+
+
+def load_env(env_file=None, override: bool = False) -> dict:
+    """Load KEY=VALUE pairs from a .env file into os.environ."""
+    env_path = Path(env_file).expanduser() if env_file is not None else DEFAULT_ENV_FILE
+    loaded = {}
+
+    if not env_path.exists():
+        return loaded
+
+    with env_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+
+            if not key:
+                continue
+            if override or key not in os.environ:
+                os.environ[key] = value
+            loaded[key] = os.environ.get(key, value)
+
+    return loaded
+
+
+load_env()
 
 lr_foldr = "lr_unet"
 hr_foldr = "hr_unet"
@@ -16,7 +50,7 @@ picture_foldr = "picture"
 log_foldr = "log_ind"
 
 local_data_path = "d:/workplace/unet3_repair_copyfrom/"
-colab_data_path = "/content/drive/MyDrive/my_models/my_model_data/"
+colab_data_path = "/Users/huawei/workplace/"
 
 
 def _resolve_base_path() -> str:
@@ -70,6 +104,7 @@ modelconfig = {
     "lr_path": lr_path,
     "hr_path": hr_path,
     "sst_file": sst_file,
+    "modesv21_data_path": os.getenv("MODESV21_DATA_PATH"),
     # "cond_dim": 10,
     # "test_ratio": 0.2,
     "seed": 42,

@@ -31,7 +31,7 @@ def main():
     print("开始执行降水数据归一化重建程序...")
     
     # 1. 查找并排序所有 NetCDF 原始数据文件
-    data_path = 'D:/MODESv21_ecmwf_seas51'
+    data_path = os.getenv("MODESV21_DATA_PATH")
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"未找到数据目录: {data_path}")
         

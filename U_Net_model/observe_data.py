@@ -1,23 +1,24 @@
 import sys
 import os
 
-# 获取当前工作目录（Jupyter Notebook 的启动目录）
-_proj_root = os.path.abspath(os.path.join(os.getcwd(), "..", ".."))
-_proj_root = os.path.normpath(_proj_root)
-if _proj_root not in sys.path:
-    sys.path.insert(0, _proj_root)
+# Ensure the parent of the HydroSynth package is on sys.path.
+_curr_file = os.path.abspath(__file__)
+_project_root = os.path.dirname(os.path.dirname(_curr_file))
+_project_parent = os.path.dirname(_project_root)
+if _project_parent not in sys.path:
+    sys.path.insert(0, _project_parent)
 import pandas as pd
 
 import numpy as np
 import HydroSynth.utils.utils as utils
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import utils.observe_norm as observe_norm
-import config
+import HydroSynth.utils.observe_norm as observe_norm
+from HydroSynth import config
 import torch
 
 
-result = pd.read_csv(r'.\utils\observe_data24.csv')
+result = pd.read_csv(os.path.join(_project_root, "utils", "observe_data24.csv"))
 result['Long'] = result['Long']/100
 result['Lat'] = result['Lat']/100
 
@@ -48,4 +49,3 @@ print(filtered_df)
 grid_data = utils.gred_time_site_to_net(df=filtered_df, to_xr=False, gred_var='anoma')
 utils.check_nan_status(grid_data)
 np.save(os.path.join(config.modelconfig['hr_path'], 'hr_data.npy'), grid_data)
-

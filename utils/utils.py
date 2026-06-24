@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from typing import List, Optional, Union
 import os
+from pathlib import Path
 import torch
 import matplotlib as mpl
 
@@ -283,7 +284,15 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
 
 
 
-def read_nc_to_npy(start: int, end: int, data_path: str = "D:\MODESv21_ecmwf_seas51") -> list:
+def read_nc_to_npy(start: int, end: int, data_path: Optional[Union[str, os.PathLike]] = None) -> list:
+    if data_path is None:
+        data_path = os.getenv("MODESV21_DATA_PATH")
+    if data_path is None:
+        raise ValueError(
+            "data_path is required. Pass it explicitly or set the MODESV21_DATA_PATH environment variable."
+        )
+
+    data_dir = Path(data_path).expanduser()
     start_year = int(str(start)[0:4])
     end_year = int(str(end)[0:4])
     start_month = int(str(start)[4:6])
@@ -293,22 +302,22 @@ def read_nc_to_npy(start: int, end: int, data_path: str = "D:\MODESv21_ecmwf_sea
 
     if start_year == end_year:
         for i in range(start_month, end_month + 1):
-            file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
-            file_name_list.append(file_name)
+            file_name = data_dir / f"MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
+            file_name_list.append(str(file_name))
     else:
         # 起始年
         for i in range(start_month, 13):
-            file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
-            file_name_list.append(file_name)
+            file_name = data_dir / f"MODESv21_ecmwf_seas51_{start_year}{str(i).zfill(2)}_monthly_em.nc"
+            file_name_list.append(str(file_name))
         # 跨年
         for year in range(start_year + 1, end_year):
             for month in range(1, 13):
-                file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{year}{str(month).zfill(2)}_monthly_em.nc"
-                file_name_list.append(file_name)
+                file_name = data_dir / f"MODESv21_ecmwf_seas51_{year}{str(month).zfill(2)}_monthly_em.nc"
+                file_name_list.append(str(file_name))
         # 结束年
         for i in range(1, end_month + 1):
-            file_name = rf"{data_path}\MODESv21_ecmwf_seas51_{end_year}{str(i).zfill(2)}_monthly_em.nc"
-            file_name_list.append(file_name)
+            file_name = data_dir / f"MODESv21_ecmwf_seas51_{end_year}{str(i).zfill(2)}_monthly_em.nc"
+            file_name_list.append(str(file_name))
 
     print('total month', len(file_name_list))
     return file_name_list
