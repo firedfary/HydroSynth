@@ -10,8 +10,8 @@ warnings.filterwarnings("ignore")
 
 # Ensure project parent is in sys.path
 _curr_file = os.path.abspath(__file__)
-_proj_root = os.path.dirname(os.path.dirname(_curr_file)) # /Users/huawei/HydroSynth
-_proj_parent = os.path.dirname(_proj_root)                # /Users/huawei
+_proj_root = os.path.dirname(os.path.dirname(_curr_file))
+_proj_parent = os.path.dirname(_proj_root)
 if _proj_parent not in sys.path:
     sys.path.insert(0, _proj_parent)
 
@@ -73,7 +73,7 @@ def compute_mca_np(X, Y, mask_x, mask_y, n_components=3, fit_train_only=True, tr
 
 def main():
     print("================ Training Best MCA-PCR Model for Lead-1 Prediction ================")
-    data_dir = "/Users/huawei/workplace/unet3D"
+    data_dir = config.modelconfig['base_data_path']
     cond_file = os.path.join(data_dir, 'lr_data_v4_aligned.npy')
     target_file = os.path.join(data_dir, 'hr_data_v4_aligned.npy')
     observe_csv = os.path.join(_proj_root, "utils", "observe_data24.csv")

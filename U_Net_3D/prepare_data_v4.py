@@ -21,7 +21,7 @@ def main():
     print("Starting data preparation for Lead-1 (V4 - Leak-Free Anomaly Normalization)...")
     
     # 1. Paths
-    data_path = os.getenv("MODESV21_DATA_PATH") or "/Volumes/Game/MODESv21_ecmwf_seas51"
+    data_path = os.getenv("MODESV21_DATA_PATH")
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data directory not found: {data_path}")
         
@@ -163,7 +163,7 @@ def main():
     final_cond = np.concatenate([lr_norm, obs_prev_norm], axis=1) # [N, 11, 120, 140]
     
     # Save the aligned datasets
-    save_dir = "/Users/huawei/workplace/unet3D"
+    save_dir = config.modelconfig['base_data_path']
     os.makedirs(save_dir, exist_ok=True)
     
     cond_save_path = os.path.join(save_dir, 'lr_data_v4_aligned.npy')
