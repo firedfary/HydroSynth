@@ -49,7 +49,7 @@ save_weight_foldr = "weight_t0"
 picture_foldr = "picture"
 log_foldr = "log_ind"
 
-local_data_path = "d:/workplace/performancetest/"
+local_data_path = "E:/workplace/U_Net_3D/"
 colab_data_path = "/Users/huawei/workplace/"
 
 
