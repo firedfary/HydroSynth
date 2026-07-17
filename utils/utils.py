@@ -20,8 +20,9 @@ import os
 from pathlib import Path
 import torch
 import matplotlib as mpl
+current_dir = os.path.dirname(os.path.abspath(__file__))
 
-def grid_to_station_interp(grid_data: np.ndarray, time_list, position_csv_path='E:\D1\diffusion\my_models\my_model_data\position.csv', var_name='Precip'):
+def grid_to_station_interp(grid_data: np.ndarray, time_list, position_csv_path=os.path.join(current_dir, 'position.csv'), var_name='Precip'):
     """
     grid_data: shape [n, 300, 350]
     time_list: 长度为 n 的时间字符串列表
@@ -98,7 +99,7 @@ def gred_month_site_to_net(df:pd.DataFrame, to_xr:bool, gred_var:str='Precip'):
         return npgrid_data
 
 
-def gred_time_site_to_net(df: pd.DataFrame, to_xr: bool, gred_var: str = 'Precip', position_csv_path='E:\D1\diffusion\my_models\my_model_data\position.csv'):
+def gred_time_site_to_net(df: pd.DataFrame, to_xr: bool, gred_var: str = 'Precip', position_csv_path=os.path.join(current_dir, 'position.csv')):
     """
     必须包含站点, 经纬度, time, Precip
 
@@ -210,7 +211,7 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
 
 
     # 地图界限
-    with open(r"E:\HydroSynth\utils\CN-border-La.gmt") as src:
+    with open(os.path.join(current_dir, "CN-border-La.gmt")) as src:
         context = src.read()
         blocks = [cnt for cnt in context.split('>') if len(cnt) > 0]
         borders = [np.fromstring(block, dtype=float, sep=' ') for block in blocks]
@@ -255,7 +256,7 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
     cbar=plt.colorbar(cf,cax=fig.add_axes([0.13, 0.20, 0.75, 0.03]),format=formatter, orientation='horizontal',cmap=cmap1)
     cbar.ax.tick_params(labelsize=14)#条子的字号
 
-    clip=maskout.shp2clip(cf,ax, r"E:\HydroSynth\utils\china0.shp")
+    clip=maskout.shp2clip(cf,ax, os.path.join(current_dir, "china0.shp"))
     sub_ax = fig.add_axes([0.76, 0.29, 0.14, 0.155],projection=myproj)#小南海的位置
     sub_ax.add_feature(cfeature.LAND.with_scale('110m'))
     for line in borders:
@@ -545,20 +546,56 @@ def check_nan_status(tensor):
 
 
 
-def cal_acc(observed:torch.Tensor, predicted:torch.Tensor) -> torch.Tensor:
-    assert observed.shape == predicted.shape, "Observed and predicted tensors must have the same shape."
-    assert observed.ndim < 4, "Observed tensor must smaller or eq 3 dimensions (time, height, width)."
-    if observed.ndim == 2:
-        observed = observed.unsqueeze(0)
-        predicted = predicted.unsqueeze(0)
-    observed_mean = torch.nanmean(observed, dim=(1, 2), keepdim=True)
-    predicted_mean = torch.nanmean(predicted, dim=(1, 2), keepdim=True)
-    A = observed - observed_mean  # Subtract mean
-    B = predicted - predicted_mean  # Subtract mean
-    C1 = torch.nansum(A * A, dim=(1, 2))  # No mul, use *
-    C2 = torch.nansum(B * B, dim=(1, 2))
-    C = torch.sqrt(C1 * C2 + 1e-8)  # Add epsilon
-    num = torch.nansum(A * B, dim=(1, 2))
+def cal_acc(observed, predicted):
+    """计算异常相关系数 (Anomaly Correlation Coefficient, ACC)。
+
+    支持 torch.Tensor 和 numpy.ndarray 输入，返回同类型结果。
+
+    Args:
+        observed: 观测值 [time, height, width] 或 [height, width]
+        predicted: 预测值，shape 同 observed
+
+    Returns:
+        ACC 序列 [time]（2D 输入则返回标量），clamp 到 [-1, 1]
+    """
+    if isinstance(observed, torch.Tensor) and isinstance(predicted, torch.Tensor):
+        _nanmean = lambda x, axis: torch.nanmean(x, dim=axis, keepdim=True)
+        _nansum = lambda x, axis: torch.nansum(x, dim=axis)
+        _sqrt = torch.sqrt
+        _clamp = lambda x: x.clamp(-1, 1)
+        _unsqueeze = lambda x: x.unsqueeze(0)
+        _ndim = lambda x: x.ndim
+    elif isinstance(observed, np.ndarray) and isinstance(predicted, np.ndarray):
+        _nanmean = lambda x, axis: np.nanmean(x, axis=axis, keepdims=True)
+        _nansum = lambda x, axis: np.nansum(x, axis=axis)
+        _sqrt = np.sqrt
+        _clamp = lambda x: np.clip(x, -1, 1)
+        _unsqueeze = lambda x: x[np.newaxis, ...]
+        _ndim = lambda x: x.ndim
+    else:
+        raise TypeError(f"observed ({type(observed)}) 和 predicted ({type(predicted)}) "
+                        "必须是同类型（torch.Tensor 或 numpy.ndarray）")
+
+    assert observed.shape == predicted.shape, \
+        "Observed and predicted tensors must have the same shape."
+    assert _ndim(observed) < 4, \
+        "Observed tensor must be smaller or equal to 3 dimensions (time, height, width)."
+
+    if _ndim(observed) == 2:
+        observed = _unsqueeze(observed)
+        predicted = _unsqueeze(predicted)
+
+    observed_mean = _nanmean(observed, (1, 2))
+    predicted_mean = _nanmean(predicted, (1, 2))
+
+    A = observed - observed_mean
+    B = predicted - predicted_mean
+
+    C1 = _nansum(A * A, (1, 2))
+    C2 = _nansum(B * B, (1, 2))
+    C = _sqrt(C1 * C2 + 1e-8)
+
+    num = _nansum(A * B, (1, 2))
     ACC = num / C
-    # Also add optional: clamp to [-1,1] if needed
-    return ACC.clamp(-1, 1)
+
+    return _clamp(ACC)

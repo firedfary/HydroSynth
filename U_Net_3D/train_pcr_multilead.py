@@ -140,7 +140,10 @@ def main():
             print(f"Warning: Failed to load {fname}: {e}")
 
     lead_avg_accs = {}
-    predict_results = []
+    obs_results_by_lead = {}
+    ec_precip_anom_results_by_lead = {}
+    predict_results_by_lead = {}
+    target_dates_by_lead = {}
     # MCA/PCA Hyperparameters aligned with train_pcr_best.py
     mca_pcs = 11
     target_pcs = 7
@@ -155,7 +158,7 @@ def main():
         
         # Step A: Find aligned target dates for Lead-L without leakage
         aligned_target_dates = []
-        for target_date in valid_dates:
+        for target_date in valid_dates: #199401-202409，366
             issue_date = target_date - pd.DateOffset(months=lead)
             if issue_date not in modes_cache:
                 continue
@@ -278,7 +281,6 @@ def main():
         # Concatenate predictor PCs
         predictor_pcs = np.concatenate([le_sst, months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
         X_train = predictor_pcs[:train_end]
-        X_test = predictor_pcs[train_end:]
         
         # Target PCA
         pca_target = PCA(n_components=target_pcs)
@@ -292,17 +294,18 @@ def main():
         reg_model = Ridge(alpha=alpha)
         reg_model.fit(X_train, y_train_pcs)
         
-        # Reconstruct prediction maps
-        pred_test_pcs = reg_model.predict(X_test)
-        pred_test_flat = pca_target.inverse_transform(pred_test_pcs)
+        # Reconstruct prediction maps for the full aligned dataset.
+        pred_all_pcs = reg_model.predict(predictor_pcs)
+        pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
         
-        pred_test_recon = np.zeros_like(target_arr[train_end:])
-        pred_test_recon[:, mask] = pred_test_flat
+        pred_all_recon = np.zeros_like(target_arr)
+        pred_all_recon[:, mask] = pred_all_flat
         
-        pred_test_smoothed = np.zeros_like(pred_test_recon)
-        for i in range(num_test):
-            pred_test_smoothed[i] = gaussian_filter(pred_test_recon[i], sigma=sigma)
-        pred_test_smoothed[:, ~mask] = 0.0
+        pred_all_smoothed = np.zeros_like(pred_all_recon)
+        for i in range(N):
+            pred_all_smoothed[i] = gaussian_filter(pred_all_recon[i], sigma=sigma)
+        pred_all_smoothed[:, ~mask] = 0.0
+        pred_test_smoothed = pred_all_smoothed[train_end:]
         
         # Evaluate ACC
         test_accs = cal_acc_np(pred_test_smoothed, target_arr[train_end:], mask)
@@ -310,9 +313,30 @@ def main():
         lead_avg_accs[lead] = avg_acc
         
         print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f}")
-        predict_results.append(pred_test_smoothed)
+        target_dates_by_lead[lead] = aligned_target_dates
+        obs_results_by_lead[lead] = target_arr
+        ec_precip_anom_results_by_lead[lead] = cond_anom[:, 0]
+        predict_results_by_lead[lead] = pred_all_smoothed
     
-    np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_predict_results.npy"), np.array(predict_results))
+    result_dates = sorted({d for dates in target_dates_by_lead.values() for d in dates})
+    result_date_to_idx = {d: i for i, d in enumerate(result_dates)}
+    result_shape = (len(result_dates), 6, 120, 140)
+    
+    obs_results = np.full(result_shape, np.nan, dtype=np.float32)
+    ec_precip_anom_results = np.full(result_shape, np.nan, dtype=np.float32)
+    predict_results = np.full(result_shape, np.nan, dtype=np.float32)
+    
+    for lead, dates in target_dates_by_lead.items():
+        date_indices = [result_date_to_idx[d] for d in dates]
+        obs_results[date_indices, lead] = obs_results_by_lead[lead]
+        ec_precip_anom_results[date_indices, lead] = ec_precip_anom_results_by_lead[lead]
+        predict_results[date_indices, lead] = predict_results_by_lead[lead]
+    
+    np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_obs_results.npy"), obs_results)
+    np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_ec_precip_anom_results.npy"), ec_precip_anom_results)
+    np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_predict_results.npy"), predict_results)
+    result_dates_str = np.array([d.strftime("%Y-%m-%d") for d in result_dates])
+    np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_dates.npy"), result_dates_str)
     print("\n================ Multi-Lead Test ACC Summary ================")
     for lead, acc in lead_avg_accs.items():
         print(f"  Lead-{lead}: {acc:.6f}")
