@@ -5,8 +5,12 @@ import pandas as pd
 import xarray as xr
 import torch
 import torch.nn.functional as F
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.decomposition import PCA
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.multioutput import MultiOutputRegressor
 from scipy.ndimage import gaussian_filter
 import tqdm
 import warnings
@@ -145,6 +149,10 @@ def main():
             print(f"Warning: Failed to load {fname}: {e}")
 
     lead_avg_accs = {}
+    lead_avg_pcr_rmse = {}
+    lead_avg_ec_rmse = {}
+    lead_avg_prmse_overall = {}
+    lead_avg_prmse_grid = {}
     obs_results_by_lead = {}
     ec_precip_anom_results_by_lead = {}
     predict_results_by_lead = {}
@@ -297,12 +305,23 @@ def main():
         else:
             y_train_pcs = pca_target.fit_transform(target_arr[:train_end][:, mask])
             
-        # Fit Ridge regression
-        reg_model = Ridge(alpha=alpha)
-        reg_model.fit(X_train, y_train_pcs)
+        # Fit Ensemble regression models (methods other than Ridge)
+        ensemble_models = {
+            "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+            "KernelRidge_Poly": KernelRidge(alpha=1.0, kernel='poly', degree=2),
+            "SVR_RBF": MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
+            "RandomForest": RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1)
+        }
         
-        # Reconstruct prediction maps for the full aligned dataset.
-        pred_all_pcs = reg_model.predict(predictor_pcs)
+        for name, model in ensemble_models.items():
+            model.fit(X_train, y_train_pcs)
+            
+        # Reconstruct prediction maps for the full aligned dataset using the ensemble average.
+        preds_pcs_list = []
+        for name, model in ensemble_models.items():
+            preds_pcs_list.append(model.predict(predictor_pcs))
+        pred_all_pcs = np.mean(preds_pcs_list, axis=0)
+        
         pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
         
         pred_all_recon = np.zeros_like(target_arr)
@@ -314,12 +333,42 @@ def main():
         pred_all_smoothed[:, ~mask] = 0.0
         pred_test_smoothed = pred_all_smoothed[train_end:]
         
-        # Evaluate ACC
-        test_accs = cal_acc_np(pred_test_smoothed, target_arr[train_end:], mask)
+        # Retrieve test actual observations and EC seas baseline
+        obs_test = target_arr[train_end:] # [21, 120, 140]
+        mod_test = cond_anom[train_end:, 0] # EC Seas anomaly [21, 120, 140]
+        
+        # 1. Evaluate ACC
+        test_accs = cal_acc_np(pred_test_smoothed, obs_test, mask)
         avg_acc = np.mean(test_accs)
         lead_avg_accs[lead] = avg_acc
         
-        print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f}")
+        # 2. Evaluate RMSE & P-RMSE decrease rates
+        sq_err_pre = (pred_test_smoothed - obs_test) ** 2
+        sq_err_mod = (mod_test - obs_test) ** 2
+        
+        pre_rmse_grid = np.sqrt(np.mean(sq_err_pre, axis=0))
+        mod_rmse_grid = np.sqrt(np.mean(sq_err_mod, axis=0))
+        
+        pre_rmse_masked = pre_rmse_grid[mask]
+        mod_rmse_masked = mod_rmse_grid[mask]
+        
+        avg_pcr_rmse = np.mean(pre_rmse_masked)
+        avg_ec_rmse = np.mean(mod_rmse_masked)
+        
+        # Overall P-RMSE Decrease Rate
+        prmse_overall = ((avg_ec_rmse - avg_pcr_rmse) / (avg_ec_rmse + 1e-8)) * 100
+        
+        # Grid-point wise average P-RMSE Decrease Rate
+        prmse_grid_masked = ((mod_rmse_masked - pre_rmse_masked) / (mod_rmse_masked + 1e-8)) * 100
+        avg_prmse_grid = np.mean(prmse_grid_masked)
+        
+        lead_avg_pcr_rmse[lead] = avg_pcr_rmse
+        lead_avg_ec_rmse[lead] = avg_ec_rmse
+        lead_avg_prmse_overall[lead] = prmse_overall
+        lead_avg_prmse_grid[lead] = avg_prmse_grid
+        
+        print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f} | PCR RMSE: {avg_pcr_rmse:.6f} | EC RMSE: {avg_ec_rmse:.6f} | Overall P-RMSE Decr: {prmse_overall:.2f}% | Grid P-RMSE: {avg_prmse_grid:.2f}%")
+        
         target_dates_by_lead[lead] = aligned_target_dates
         obs_results_by_lead[lead] = target_arr
         # Slice global precip anomaly cond_anom[:, 0] (shape [N, 180, 360]) to China region
@@ -350,9 +399,11 @@ def main():
     np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_predict_results.npy"), predict_results)
     result_dates_str = np.array([d.strftime("%Y-%m-%d") for d in result_dates])
     np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_dates.npy"), result_dates_str)
-    print("\n================ Multi-Lead Test ACC Summary ================")
-    for lead, acc in lead_avg_accs.items():
-        print(f"  Lead-{lead}: {acc:.6f}")
+    print("\n================ Multi-Lead Test Performance Summary ================")
+    print(f"  {'Lead':<6} | {'ACC':<10} | {'PCR RMSE':<10} | {'EC RMSE':<10} | {'P-RMSE Decr (Overall)':<22} | {'P-RMSE (Grid)':<12}")
+    print("-" * 85)
+    for lead in sorted(lead_avg_accs.keys()):
+        print(f"  Lead-{lead:<1} | {lead_avg_accs[lead]:.6f} | {lead_avg_pcr_rmse[lead]:.6f} | {lead_avg_ec_rmse[lead]:.6f} | {lead_avg_prmse_overall[lead]:.2f}% | {lead_avg_prmse_grid[lead]:.2f}%")
     
 if __name__ == "__main__":
     main()
