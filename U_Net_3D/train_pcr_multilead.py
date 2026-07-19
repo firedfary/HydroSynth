@@ -52,22 +52,30 @@ def compute_mca_np(X, Y, mask_x, mask_y, n_components=3, fit_train_only=True, tr
     if fit_train_only:
         mean_x = flat_x[:train_end].mean(axis=0)
         mean_y = flat_y[:train_end].mean(axis=0)
+        T_fit = train_end
     else:
         mean_x = flat_x.mean(axis=0)
         mean_y = flat_y.mean(axis=0)
+        T_fit = T
         
     flat_x_centered = flat_x - mean_x
     flat_y_centered = flat_y - mean_y
     
-    if fit_train_only:
-        C = (flat_x_centered[:train_end].T @ flat_y_centered[:train_end]) / (train_end - 1)
-    else:
-        C = (flat_x_centered.T @ flat_y_centered) / (T - 1)
-        
-    U, s, Vt = np.linalg.svd(C, full_matrices=False)
+    # Efficient SVD/MCA using thin SVD of X_fit and Y_fit (T_fit << P_x, P_y)
+    X_fit = flat_x_centered[:T_fit]
+    Y_fit = flat_y_centered[:T_fit]
     
-    U = U[:, :n_components]
-    V = Vt[:n_components, :].T
+    U_x, s_x, Vt_x = np.linalg.svd(X_fit, full_matrices=False)
+    U_y, s_y, Vt_y = np.linalg.svd(Y_fit, full_matrices=False)
+    
+    # Core covariance matrix of size [T_fit, T_fit]
+    M = (U_x.T @ U_y) * s_x[:, None] * s_y[None, :] / (T_fit - 1)
+    
+    U_m, s_m, Vt_m = np.linalg.svd(M, full_matrices=False)
+    
+    # Recover truncated spatial patterns: U = V_x @ U_m and V = V_y @ V_m
+    U = Vt_x.T @ U_m[:, :n_components]
+    V = Vt_y.T @ Vt_m[:n_components, :].T
     
     le = flat_x_centered @ U
     re = flat_y_centered @ V
@@ -124,15 +132,12 @@ def main():
             continue
         try:
             ds = xr.open_dataset(fpath)
-            # Select 10 channels, slice spatial grid, and extract lead 0-5
-            selected = ds[['tp', 'h200', 'h500', 'slp', 't2m', 't850', 'u200', 'u850', 'v200', 'v850']].sel(
-                longitude=slice(70, 140), 
-                latitude=slice(60, 0)
-            )
-            # Extracted array shape: [6, 10, 60, 70] (time=slice(0, 6))
+            # Select 10 channels globally, and extract lead 0-5
+            selected = ds[['tp', 'h200', 'h500', 'slp', 't2m', 't850', 'u200', 'u850', 'v200', 'v850']]
+            # Extracted array shape: [6, 10, 180, 360] (time=slice(0, 6))
             cond_data = selected.isel(time=slice(0, 6)).to_array().to_numpy() 
-            # Reorder dimensions from [10, 6, 60, 70] to [6, 10, 60, 70]
-            cond_data = np.swapaxes(cond_data, 0, 1) # [6, 10, 60, 70]
+            # Reorder dimensions from [10, 6, 180, 360] to [6, 10, 180, 360]
+            cond_data = np.swapaxes(cond_data, 0, 1) # [6, 10, 180, 360]
             
             modes_cache[issue_date] = cond_data
             ds.close()
@@ -220,9 +225,8 @@ def main():
         lags_arr = np.nan_to_num(np.stack(lags_list), nan=0.0)   # [N, 4, 120, 140]
         target_arr = np.nan_to_num(np.stack(target_list), nan=0.0) # [N, 120, 140]
         
-        # Bicubic interpolate forecast fields to [120, 140]
-        cond_tensor = torch.from_numpy(cond_arr)
-        cond_interp = F.interpolate(cond_tensor, scale_factor=2.0, mode='bicubic').numpy() # [N, 10, 120, 140]
+        # Process global forecast fields directly at their native resolution [N, 10, 180, 360]
+        cond_interp = cond_arr.copy()
         
         # Convert precip forecast to mm/month
         cond_interp[:, 0] = cond_interp[:, 0] * 31*24*60*60*1000
@@ -267,10 +271,13 @@ def main():
         # Step C: Max Covariance Analysis (MCA)
         # 1. SST MCA
         le_sst, _ = compute_mca_np(sst_arr, target_arr, mask_sst, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
-        # 2. 10 channels MCA
+        # Define global forecast mask
+        mask_cond = ~np.isnan(cond_norm[0, 0])
+
+        # 2. 10 channels MCA (using global mask for predictor, regional mask for target)
         le_channels = []
         for c in range(10):
-            le_c, _ = compute_mca_np(cond_norm[:, c], target_arr, mask, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
+            le_c, _ = compute_mca_np(cond_norm[:, c], target_arr, mask_cond, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
             le_channels.append(le_c)
         # 3. 4 Lags MCA
         le_lags = []
@@ -315,7 +322,13 @@ def main():
         print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f}")
         target_dates_by_lead[lead] = aligned_target_dates
         obs_results_by_lead[lead] = target_arr
-        ec_precip_anom_results_by_lead[lead] = cond_anom[:, 0]
+        # Slice global precip anomaly cond_anom[:, 0] (shape [N, 180, 360]) to China region
+        # latitude index 30:90, longitude index 70:140, then interpolate to [120, 140]
+        cond_anom_china = cond_anom[:, 0, 30:90, 70:140]
+        cond_anom_china_tensor = torch.from_numpy(cond_anom_china[:, None])
+        cond_anom_china_interp = F.interpolate(cond_anom_china_tensor, size=(120, 140), mode='bicubic').numpy()[:, 0]
+        
+        ec_precip_anom_results_by_lead[lead] = cond_anom_china_interp
         predict_results_by_lead[lead] = pred_all_smoothed
     
     result_dates = sorted({d for dates in target_dates_by_lead.values() for d in dates})
