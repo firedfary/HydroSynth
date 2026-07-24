@@ -101,7 +101,7 @@ def main():
     all_dates = pd.date_range(start='1994-01-01', end='2024-09-01', freq='MS')
     exclude_dates = [pd.to_datetime(d) for d in ['2017-01-01', '2011-09-01', '2011-10-01']]
     valid_dates = [d for d in all_dates if d not in exclude_dates]
-    date_to_idx = {d: i for i, d in enumerate(valid_dates)}
+    date_to_idx = {d: i for i, d in enumerate(valid_dates)} #366
     
     # Load High-Resolution Observation grid
     hr_obs_path = os.path.join(config.modelconfig['hr_path'], 'hr_data.npy')
@@ -205,7 +205,7 @@ def main():
             issue_date = target_date - pd.DateOffset(months=lead)
             
             # 1. Forecast variables (Extracted from memory cache!)
-            cond_lead = modes_cache[issue_date][lead] # [10, 60, 70]
+            cond_lead = modes_cache[issue_date][lead] # [10, 180, 360]
             cond_list.append(cond_lead)
             
             # 2. SST
@@ -228,8 +228,8 @@ def main():
             # 4. Target
             target_list.append(hr_obs_full[date_to_idx[target_date]])
             
-        cond_arr = np.stack(cond_list)   # [N, 10, 60, 70]
-        sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)     # [N, 180, 360]
+        cond_arr = np.stack(cond_list)   # [N, 10, 180, 360]
+        sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)     # [N, 89, 180]
         lags_arr = np.nan_to_num(np.stack(lags_list), nan=0.0)   # [N, 4, 120, 140]
         target_arr = np.nan_to_num(np.stack(target_list), nan=0.0) # [N, 120, 140]
         
@@ -333,9 +333,15 @@ def main():
         pred_all_smoothed[:, ~mask] = 0.0
         pred_test_smoothed = pred_all_smoothed[train_end:]
         
+        # Slice global precip anomaly cond_anom[:, 0] (shape [N, 180, 360]) to China region
+        # latitude index 30:90, longitude index 70:140, then interpolate to [120, 140]
+        cond_anom_china = cond_anom[:, 0, 30:90, 70:140]
+        cond_anom_china_tensor = torch.from_numpy(cond_anom_china[:, None])
+        cond_anom_china_interp = F.interpolate(cond_anom_china_tensor, size=(120, 140), mode='bicubic').numpy()[:, 0]
+        
         # Retrieve test actual observations and EC seas baseline
         obs_test = target_arr[train_end:] # [21, 120, 140]
-        mod_test = cond_anom[train_end:, 0] # EC Seas anomaly [21, 120, 140]
+        mod_test = cond_anom_china_interp[train_end:] # EC Seas anomaly [21, 120, 140]
         
         # 1. Evaluate ACC
         test_accs = cal_acc_np(pred_test_smoothed, obs_test, mask)
@@ -371,12 +377,6 @@ def main():
         
         target_dates_by_lead[lead] = aligned_target_dates
         obs_results_by_lead[lead] = target_arr
-        # Slice global precip anomaly cond_anom[:, 0] (shape [N, 180, 360]) to China region
-        # latitude index 30:90, longitude index 70:140, then interpolate to [120, 140]
-        cond_anom_china = cond_anom[:, 0, 30:90, 70:140]
-        cond_anom_china_tensor = torch.from_numpy(cond_anom_china[:, None])
-        cond_anom_china_interp = F.interpolate(cond_anom_china_tensor, size=(120, 140), mode='bicubic').numpy()[:, 0]
-        
         ec_precip_anom_results_by_lead[lead] = cond_anom_china_interp
         predict_results_by_lead[lead] = pred_all_smoothed
     
