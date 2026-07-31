@@ -5,7 +5,16 @@ from scipy.interpolate import griddata
 import xarray as xr
 from metpy.interpolate import inverse_distance_to_grid
 from functools import reduce
-from . import maskout
+try:
+    from . import maskout
+except (ImportError, ValueError):
+    try:
+        import utils.maskout as maskout
+    except ImportError:
+        try:
+            from HydroSynth.utils import maskout
+        except ImportError:
+            import maskout
 import cartopy.crs as ccrs
 from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
@@ -171,17 +180,18 @@ def clip_data(size_per_image:int, data_lenth:int) -> list:
 
 
 
+class MidpointNormalize(matplotlib.colors.Normalize): 
+    def __init__(self, vmin=None, vmax=None, midpoint=None, clip=False):
+        self.midpoint = midpoint
+        super().__init__(vmin, vmax, clip)
+
+    def __call__(self, value, clip=None):
+        x, y = [self.vmin, self.midpoint, self.vmax], [0, 0.5, 1]
+        return np.ma.masked_array(np.interp(value, x, y))
+
+
 def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=None, max:float=None, save_path:str=None, color_mode:str="blue"):
     np.set_printoptions(suppress=True)
-
-    class MidpointNormalize(matplotlib.colors.Normalize): 
-        def __init__(self, vmin=None, vmax=None, midpoint=None, clip=False):
-            self.midpoint = midpoint
-            super().__init__(vmin, vmax, clip)
-
-        def __call__(self, value, clip=None):
-            x, y = [self.vmin, self.midpoint, self.vmax], [0, 0.5, 1]
-            return np.ma.masked_array(np.interp(value, x, y))
 
 
 
@@ -270,6 +280,444 @@ def draw_rainfall_map(draw_what:np.ndarray, picture_name:str=None, min:float=Non
     if save_path is not None:
         plt.savefig(save_path, format='svg')
     plt.show()
+
+
+def _draw_single_panel_worker(
+    draw_what: Optional[np.ndarray],
+    lon: np.ndarray,
+    lat: np.ndarray,
+    vmin: float,
+    vmax: float,
+    midpoint: float,
+    lim: np.ndarray,
+    color_mode: str,
+    picture_name: Optional[str],
+    show_cbar: bool,
+    is_empty_cell: bool,
+    current_dir: str
+) -> bytes:
+    import io
+    import os
+    import numpy as np
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.colors
+    import matplotlib.ticker as ticker
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+    import matplotlib as mpl
+    
+    try:
+        from . import maskout
+    except Exception:
+        try:
+            import utils.maskout as maskout
+        except Exception:
+            try:
+                from HydroSynth.utils import maskout
+            except Exception:
+                import maskout
+
+    fig = plt.figure(figsize=(6, 5), facecolor='white')
+    myproj = ccrs.PlateCarree(central_longitude=0.0)
+    
+    base_colors = ['#E11300', '#FF3100', '#FF9F00', '#FFBF3B', '#FFE877','#B3F0FA', '#95D2FA', '#77B8FA', '#4FA4F5', '#3B95F5']
+    if color_mode == "red":
+        base_colors = base_colors[::-1]
+    cmap1 = mpl.colors.ListedColormap(base_colors)
+    cmap1.set_over('darkred')
+    cmap1.set_under('navy')
+    
+    ax_pos = [0.10, 0.15, 0.88, 0.83]
+    
+    if not is_empty_cell and draw_what is not None:
+        ax = fig.add_axes(ax_pos, projection=myproj)
+        ax.add_feature(cfeature.LAND.with_scale('110m'))
+        
+        with open(os.path.join(current_dir, "CN-border-La.gmt")) as src:
+            context = src.read()
+            blocks = [cnt for cnt in context.split('>') if len(cnt) > 0]
+            borders = [np.fromstring(block, dtype=float, sep=' ') for block in blocks]
+            
+        for line in borders:
+            ax.plot(line[0::2], line[1::2], '-', lw=0.5, color='k', transform=ccrs.Geodetic())
+            
+        ax.set_extent([70, 140, 10, 60])
+        ax.set_xticks(range(70, 141, 10), crs=ccrs.PlateCarree())
+        ax.set_yticks(range(10, 61, 10), crs=ccrs.PlateCarree())
+        
+        lon_formatter = LongitudeFormatter(zero_direction_label=False)
+        lat_formatter = LatitudeFormatter()
+        ax.xaxis.set_major_formatter(lon_formatter)
+        ax.yaxis.set_major_formatter(lat_formatter)
+        ax.tick_params(axis='both', labelsize=14)
+        
+        norm = MidpointNormalize(vmin=vmin, vmax=vmax, midpoint=midpoint)
+        cf = ax.contourf(lon, lat, draw_what, levels=lim, cmap=cmap1, extend='both', zorder=0, transform=ccrs.PlateCarree(), norm=norm)
+        
+        maskout.shp2clip(cf, ax, os.path.join(current_dir, "china0.shp"))
+        
+        # Position South China Sea inset dynamically relative to actual shrunk map bounds
+        fig.canvas.draw()
+        pos = ax.get_position()
+        
+        sub_ax_left = pos.x0 + 0.825 * pos.width
+        sub_ax_bottom = pos.y0 + 0.01 * pos.height
+        sub_ax_width = 0.175 * pos.width
+        sub_ax_height = 0.25 * pos.height
+        
+        sub_ax = fig.add_axes([sub_ax_left, sub_ax_bottom, sub_ax_width, sub_ax_height], projection=myproj)
+        sub_ax.add_feature(cfeature.LAND.with_scale('110m'))
+        for line in borders:
+            sub_ax.plot(line[0::2], line[1::2], '-', lw=0.5, color='k', transform=ccrs.Geodetic())
+        sub_ax.set_extent([105, 125, 0, 25])
+        
+        if picture_name is not None:
+            ax.text(.01, .99, picture_name, ha='left', va='top', transform=ax.transAxes, fontsize=16)
+            
+    if show_cbar:
+        norm = MidpointNormalize(vmin=vmin, vmax=vmax, midpoint=midpoint)
+        if not is_empty_cell and draw_what is not None:
+            mappable = cf
+        else:
+            mappable = plt.cm.ScalarMappable(cmap=cmap1, norm=norm)
+            mappable.set_array([])
+            
+        if not is_empty_cell and draw_what is not None:
+            fig.canvas.draw()
+            pos = ax.get_position()
+        else:
+            pos = matplotlib.transforms.Bbox.from_bounds(0.1000, 0.1544, 0.8800, 0.8211)
+            
+        cbar_left = pos.x0 + pos.width * 0.05
+        cbar_bottom = pos.y0 - 0.10
+        cbar_width = pos.width * 0.9
+        cbar_height = 0.035
+        
+        cbar_ax = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
+        formatter = ticker.FormatStrFormatter('%.1f')
+        cbar = fig.colorbar(mappable, cax=cbar_ax, format=formatter, orientation='horizontal', extend='both')
+        cbar.ax.tick_params(labelsize=14)
+        
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def draw_multiple_rainfall_maps(
+    data_list: List[np.ndarray],
+    *,
+    ncols: int = 3,
+    col_mins: Optional[Union[float, List[Optional[float]]]] = None,
+    col_maxs: Optional[Union[float, List[Optional[float]]]] = None,
+    save_path: Optional[str] = None,
+    numbering: bool = True,
+    parallel: bool = True,
+    color_mode: str = "blue",
+    show: bool = True,
+    **kwargs
+):
+    """
+    Draw a grid of multiple rainfall maps.
+
+    Parameters:
+    -----------
+    data_list : List[np.ndarray]
+        List of 2D numpy arrays to plot.
+    ncols : int, optional (default: 3)
+        Number of columns in the subplot grid.
+    col_mins : float or List[Optional[float]], optional
+        Min limit for colorbars. If single float, applied to all columns.
+        If list/tuple, applied column-wise. If None, auto-calculated.
+    col_maxs : float or List[Optional[float]], optional
+        Max limit for colorbars. If single float, applied to all columns.
+        If list/tuple, applied column-wise. If None, auto-calculated.
+    save_path : str, optional
+        File path to save the final figure. If empty/None, the figure is not saved.
+    numbering : bool, optional (default: True)
+        Whether to add letters (a), (b), (c) in sequential order.
+    parallel : bool, optional (default: True)
+        Whether to render subplots in parallel using multiprocessing (faster, PNG/raster).
+        Set to False to use sequential matplotlib subplots (preserves vector/SVG format).
+    color_mode : str, optional (default: "blue")
+        Colorbar mode ("blue" or "red").
+    show : bool, optional (default: True)
+        Whether to display the figure. Returns nothing either way.
+    """
+    n = len(data_list)
+    if n == 0:
+        raise ValueError("data_list cannot be empty.")
+
+    import math
+    nrows = math.ceil(n / ncols)
+
+    # Normalize col_mins and col_maxs to lists of length ncols
+    if col_mins is None:
+        col_mins = [None] * ncols
+    elif isinstance(col_mins, (int, float)):
+        col_mins = [col_mins] * ncols
+    else:
+        col_mins = list(col_mins)
+        if len(col_mins) < ncols:
+            col_mins += [None] * (ncols - len(col_mins))
+
+    if col_maxs is None:
+        col_maxs = [None] * ncols
+    elif isinstance(col_maxs, (int, float)):
+        col_maxs = [col_maxs] * ncols
+    else:
+        col_maxs = list(col_maxs)
+        if len(col_maxs) < ncols:
+            col_maxs += [None] * (ncols - len(col_maxs))
+
+    # Calculate min, max, midpoint, levels for each column
+    col_limits = []
+    for c in range(ncols):
+        col_indices = [idx for idx in range(c, n, ncols)]
+        if not col_indices:
+            col_limits.append((None, None, None, None))
+            continue
+        
+        col_data = [data_list[idx] for idx in col_indices]
+        
+        # Get column min
+        c_min = col_mins[c]
+        if c_min is None:
+            c_min = min(float(np.nanmin(arr)) for arr in col_data)
+            
+        # Get column max
+        c_max = col_maxs[c]
+        if c_max is None:
+            c_max = max(float(np.nanmax(arr)) for arr in col_data)
+            
+        # Levels and midpoint
+        if c_min >= 0 and c_max > 0:
+            lim = np.linspace(c_min, c_max, 7)
+            midpoint = (c_min + c_max) / 2
+        elif c_max <= 0 and c_min < 0:
+            lim = np.linspace(c_min, c_max, 7)
+            midpoint = (c_min + c_max) / 2
+        else:
+            lim = np.concatenate((np.linspace(c_min, 0, 4), np.delete(np.linspace(0, c_max, 4), 0)), axis=0)
+            midpoint = 0.0
+            
+        col_limits.append((c_min, c_max, midpoint, lim))
+
+    # Get coordinate arrays from the first data array
+    first_arr = data_list[0]
+    lon = np.linspace(70, 140, first_arr.shape[1])
+    lat = np.linspace(60, 0, first_arr.shape[0])
+
+    # Numbering labels
+    def get_label(i):
+        if not numbering:
+            return None
+        if i < 26:
+            return f"({chr(97 + i)})"
+        return f"({i + 1})"
+
+    if parallel:
+        from concurrent.futures import ProcessPoolExecutor
+        import io
+        from PIL import Image
+
+        tasks = []
+        for r in range(nrows):
+            for c in range(ncols):
+                idx = r * ncols + c
+                vmin, vmax, midpoint, lim = col_limits[c]
+                
+                # Check if this column's last active map is in row r (or if it's the last row and we need to draw a colorbar)
+                col_indices = [i for i in range(c, n, ncols)]
+                last_active_idx = col_indices[-1]
+                last_active_row = last_active_idx // ncols
+                
+                show_cbar = False
+                is_empty_cell = False
+                
+                if idx < n:
+                    if r == nrows - 1:
+                        show_cbar = True
+                else:
+                    is_empty_cell = True
+                    if r == nrows - 1 and last_active_row < nrows - 1:
+                        show_cbar = True
+                
+                draw_data = data_list[idx] if idx < n else None
+                label = get_label(idx) if idx < n else None
+                
+                tasks.append((
+                    draw_data, lon, lat, vmin, vmax, midpoint, lim,
+                    color_mode, label, show_cbar, is_empty_cell, current_dir
+                ))
+
+        with ProcessPoolExecutor() as executor:
+            futures = [executor.submit(_draw_single_panel_worker, *t) for t in tasks]
+            results = [f.result() for f in futures]
+
+        images = [Image.open(io.BytesIO(img_bytes)) for img_bytes in results]
+        w, h = images[0].size
+        combined_img = Image.new('RGB', (ncols * w, nrows * h), color='white')
+        
+        for idx, img in enumerate(images):
+            r = idx // ncols
+            c = idx % ncols
+            combined_img.paste(img, (c * w, r * h))
+
+        if save_path:
+            if save_path.lower().endswith('.svg'):
+                print("Warning: Parallel mode does not support SVG format. Saving as PNG instead.")
+                save_path = save_path[:-4] + ".png"
+            combined_img.save(save_path)
+
+        if show:
+            try:
+                from IPython.display import display
+                display(combined_img)
+            except ImportError:
+                pass
+
+    else:
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+        import matplotlib.colors
+        import matplotlib.ticker as ticker
+        import matplotlib as mpl
+        from . import maskout
+
+        myproj = ccrs.PlateCarree(central_longitude=0.0)
+        
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 6, nrows * 5), 
+                                 subplot_kw={'projection': myproj}, 
+                                 facecolor='white', squeeze=False)
+        
+        with open(os.path.join(current_dir, "CN-border-La.gmt")) as src:
+            context = src.read()
+            blocks = [cnt for cnt in context.split('>') if len(cnt) > 0]
+            borders = [np.fromstring(block, dtype=float, sep=' ') for block in blocks]
+
+        base_colors = ['#E11300', '#FF3100', '#FF9F00', '#FFBF3B', '#FFE877','#B3F0FA', '#95D2FA', '#77B8FA', '#4FA4F5', '#3B95F5']
+        if color_mode == "red":
+            base_colors = base_colors[::-1]
+        cmap1 = mpl.colors.ListedColormap(base_colors)
+        cmap1.set_over('darkred')
+        cmap1.set_under('navy')
+
+        col_cfs = [None] * ncols
+
+        # Manually set axes positions to match the worker layout exactly
+        for r in range(nrows):
+            for c in range(ncols):
+                ax = axes[r, c]
+                left = (c + 0.10) / ncols
+                bottom = (nrows - 1 - r + 0.15) / nrows
+                width = 0.88 / ncols
+                height = 0.83 / nrows
+                ax.set_position([left, bottom, width, height])
+
+        for r in range(nrows):
+            for c in range(ncols):
+                idx = r * ncols + c
+                ax = axes[r, c]
+                
+                if idx < n:
+                    draw_what = data_list[idx]
+                    vmin, vmax, midpoint, lim = col_limits[c]
+                    
+                    ax.add_feature(cfeature.LAND.with_scale('110m'))
+                    for line in borders:
+                        ax.plot(line[0::2], line[1::2], '-', lw=0.5, color='k', transform=ccrs.Geodetic())
+                        
+                    ax.set_extent([70, 140, 10, 60])
+                    ax.set_xticks(range(70, 141, 10), crs=ccrs.PlateCarree())
+                    ax.set_yticks(range(10, 61, 10), crs=ccrs.PlateCarree())
+                    
+                    lon_formatter = LongitudeFormatter(zero_direction_label=False)
+                    lat_formatter = LatitudeFormatter()
+                    ax.xaxis.set_major_formatter(lon_formatter)
+                    ax.yaxis.set_major_formatter(lat_formatter)
+                    ax.tick_params(axis='both', labelsize=14)
+                    
+                    norm = MidpointNormalize(vmin=vmin, vmax=vmax, midpoint=midpoint)
+                    cf = ax.contourf(lon, lat, draw_what, levels=lim, cmap=cmap1, extend='both', zorder=0, transform=ccrs.PlateCarree(), norm=norm)
+                    col_cfs[c] = cf
+                    
+                    maskout.shp2clip(cf, ax, os.path.join(current_dir, "china0.shp"))
+                    
+                    ax._borders = borders
+                    
+                    label = get_label(idx)
+                    if label is not None:
+                        ax.text(.01, .99, label, ha='left', va='top', transform=ax.transAxes, fontsize=14)
+                else:
+                    ax.axis('off')
+
+        fig.canvas.draw()
+        
+        # Position South China Sea insets dynamically in active subplots
+        for r in range(nrows):
+            for c in range(ncols):
+                idx = r * ncols + c
+                if idx < n:
+                    ax = axes[r, c]
+                    pos = ax.get_position()
+                    
+                    sub_ax_left = pos.x0 + 0.825 * pos.width
+                    sub_ax_bottom = pos.y0 + 0.01 * pos.height
+                    sub_ax_width = 0.175 * pos.width
+                    sub_ax_height = 0.25 * pos.height
+                    
+                    sub_ax = fig.add_axes([sub_ax_left, sub_ax_bottom, sub_ax_width, sub_ax_height], projection=myproj)
+                    sub_ax.add_feature(cfeature.LAND.with_scale('110m'))
+                    for line in ax._borders:
+                        sub_ax.plot(line[0::2], line[1::2], '-', lw=0.5, color='k', transform=ccrs.Geodetic())
+                    sub_ax.set_extent([105, 125, 0, 25])
+
+        # Draw colorbars aligned at the bottom row (row nrows-1)
+        for c in range(ncols):
+            vmin, vmax, midpoint, lim = col_limits[c]
+            if vmin is None:
+                continue
+                
+            ref_ax_row = axes[nrows - 1, 0]
+            ref_ax_col = axes[0, c]
+            
+            row_pos = ref_ax_row.get_position()
+            col_pos = ref_ax_col.get_position()
+            
+            cbar_left = col_pos.x0 + col_pos.width * 0.05
+            cbar_bottom = row_pos.y0 - 0.10 / nrows
+            cbar_width = col_pos.width * 0.9
+            cbar_height = 0.035 / nrows
+            
+            cbar_ax = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
+            
+            cf = col_cfs[c]
+            if cf is not None:
+                mappable = cf
+            else:
+                norm = MidpointNormalize(vmin=vmin, vmax=vmax, midpoint=midpoint)
+                mappable = plt.cm.ScalarMappable(cmap=cmap1, norm=norm)
+                mappable.set_array([])
+                
+            formatter = ticker.FormatStrFormatter('%.1f')
+            cbar = fig.colorbar(mappable, cax=cbar_ax, ticks=lim, format=formatter, orientation='horizontal', extend='both')
+            cbar.ax.tick_params(labelsize=14)
+
+        if save_path:
+            fmt = 'svg' if '.' not in os.path.basename(save_path) else None
+            plt.savefig(save_path, format=fmt, bbox_inches='tight')
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 
 

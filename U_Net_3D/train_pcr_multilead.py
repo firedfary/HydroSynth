@@ -11,6 +11,7 @@ from sklearn.kernel_ridge import KernelRidge
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.model_selection import KFold
 from scipy.ndimage import gaussian_filter
 import tqdm
 import warnings
@@ -149,6 +150,7 @@ def main():
             print(f"Warning: Failed to load {fname}: {e}")
 
     lead_avg_accs = {}
+    lead_avg_ec_accs = {}
     lead_avg_pcr_rmse = {}
     lead_avg_ec_rmse = {}
     lead_avg_prmse_overall = {}
@@ -157,16 +159,25 @@ def main():
     ec_precip_anom_results_by_lead = {}
     predict_results_by_lead = {}
     target_dates_by_lead = {}
-    # MCA/PCA Hyperparameters aligned with train_pcr_best.py
-    mca_pcs = 11
-    target_pcs = 7
+    # MCA/PCA Hyperparameters and settings
+    lead_hyperparams = {
+        0: {"mca_pcs": 12, "target_pcs": 8, "sigma": 1.0},
+        1: {"mca_pcs": 11, "target_pcs": 7, "sigma": 1.5},
+        2: {"mca_pcs": 10, "target_pcs": 7, "sigma": 1.8},
+        3: {"mca_pcs": 9,  "target_pcs": 6, "sigma": 2.0},
+        4: {"mca_pcs": 7,  "target_pcs": 5, "sigma": 2.2},
+        5: {"mca_pcs": 6,  "target_pcs": 4, "sigma": 2.5}
+    }
     alpha = 5.0
-    sigma = 1.5
     fit_on_full = True
     num_test = 21
     
     # Loop over all 6 leads (Lead 0 to Lead 5)
     for lead in range(6):
+        hparams = lead_hyperparams[lead]
+        mca_pcs = hparams["mca_pcs"]
+        target_pcs = hparams["target_pcs"]
+        sigma = hparams["sigma"]
         print(f"\n>>> Processing Lead-{lead} Model training & evaluation...")
         
         # Step A: Find aligned target dates for Lead-L without leakage
@@ -238,6 +249,8 @@ def main():
         
         # Convert precip forecast to mm/month
         cond_interp[:, 0] = cond_interp[:, 0] * 31*24*60*60*1000
+        # Zero-clipping for precipitation to prevent negative forecast anomalies
+        cond_interp[:, 0] = np.clip(cond_interp[:, 0], 0.0, None)
         
         # Train/Test boundaries
         train_end = N - num_test
@@ -279,13 +292,21 @@ def main():
         # Step C: Max Covariance Analysis (MCA)
         # 1. SST MCA
         le_sst, _ = compute_mca_np(sst_arr, target_arr, mask_sst, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
-        # Define global forecast mask
-        mask_cond = ~np.isnan(cond_norm[0, 0])
+        # Define global and regional forecast masks
+        mask_cond_global = ~np.isnan(cond_norm[0, 0])
+        mask_cond_regional = np.ones((60, 70), dtype=bool)
 
-        # 2. 10 channels MCA (using global mask for predictor, regional mask for target)
+        # 2. 10 channels MCA (using regional mask for regional variables, global mask for global ones)
+        regional_channels = [0, 4, 5, 7, 9]  # tp, t2m, t850, u850, v850
         le_channels = []
         for c in range(10):
-            le_c, _ = compute_mca_np(cond_norm[:, c], target_arr, mask_cond, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
+            if c in regional_channels:
+                # Regional variables: Slice to China region [30:90, 70:140] and perform MCA
+                cond_norm_reg = cond_norm[:, c, 30:90, 70:140]
+                le_c, _ = compute_mca_np(cond_norm_reg, target_arr, mask_cond_regional, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
+            else:
+                # Global variables: Perform MCA on global native resolution
+                le_c, _ = compute_mca_np(cond_norm[:, c], target_arr, mask_cond_global, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
             le_channels.append(le_c)
         # 3. 4 Lags MCA
         le_lags = []
@@ -305,22 +326,52 @@ def main():
         else:
             y_train_pcs = pca_target.fit_transform(target_arr[:train_end][:, mask])
             
-        # Fit Ensemble regression models (methods other than Ridge)
-        ensemble_models = {
-            "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
-            "KernelRidge_Poly": KernelRidge(alpha=1.0, kernel='poly', degree=2),
-            "SVR_RBF": MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
-            "RandomForest": RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1)
-        }
+        # Define base models creator
+        def get_base_models():
+            return {
+                "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+                "KernelRidge_Poly": KernelRidge(alpha=1.0, kernel='poly', degree=2),
+                "SVR_RBF": MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
+                "RandomForest": RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1)
+            }
+            
+        # Perform 5-Fold Cross-Validation on training set to obtain Out-Of-Fold (OOF) predictions
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        oof_preds = np.zeros((train_end, target_pcs, 4))
+        model_names = ["ElasticNet", "KernelRidge_Poly", "SVR_RBF", "RandomForest"]
         
+        for train_idx, val_idx in kf.split(X_train):
+            X_tr, X_val = X_train[train_idx], X_train[val_idx]
+            y_tr, y_val = y_train_pcs[train_idx], y_train_pcs[val_idx]
+            
+            fold_models = get_base_models()
+            for idx, name in enumerate(model_names):
+                fold_models[name].fit(X_tr, y_tr)
+                oof_preds[val_idx, :, idx] = fold_models[name].predict(X_val)
+                
+        # Learn meta-regressor weights using Ridge to combine base models robustly
+        # Flatten OOF predictions and training targets along samples and PC dimensions
+        X_meta = oof_preds.reshape(-1, 4)
+        y_meta = y_train_pcs.reshape(-1)
+        
+        meta_regressor = Ridge(alpha=10.0, fit_intercept=False)
+        meta_regressor.fit(X_meta, y_meta)
+        weights = meta_regressor.coef_
+        
+        print(f"Lead-{lead} Stacking weights: EN={weights[0]:.4f}, KR={weights[1]:.4f}, SVR={weights[2]:.4f}, RF={weights[3]:.4f}")
+        
+        # Train base models on the FULL training set
+        ensemble_models = get_base_models()
         for name, model in ensemble_models.items():
             model.fit(X_train, y_train_pcs)
             
-        # Reconstruct prediction maps for the full aligned dataset using the ensemble average.
+        # Reconstruct prediction maps for the full aligned dataset using learned weights
         preds_pcs_list = []
         for name, model in ensemble_models.items():
             preds_pcs_list.append(model.predict(predictor_pcs))
-        pred_all_pcs = np.mean(preds_pcs_list, axis=0)
+            
+        preds_pcs_stacked = np.stack(preds_pcs_list, axis=2) # [N, target_pcs, 4]
+        pred_all_pcs = preds_pcs_stacked @ weights # [N, target_pcs]
         
         pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
         
@@ -348,6 +399,11 @@ def main():
         avg_acc = np.mean(test_accs)
         lead_avg_accs[lead] = avg_acc
         
+        # 1b. Evaluate EC ACC
+        test_ec_accs = cal_acc_np(mod_test, obs_test, mask)
+        avg_ec_acc = np.mean(test_ec_accs)
+        lead_avg_ec_accs[lead] = avg_ec_acc
+        
         # 2. Evaluate RMSE & P-RMSE decrease rates
         sq_err_pre = (pred_test_smoothed - obs_test) ** 2
         sq_err_mod = (mod_test - obs_test) ** 2
@@ -373,7 +429,7 @@ def main():
         lead_avg_prmse_overall[lead] = prmse_overall
         lead_avg_prmse_grid[lead] = avg_prmse_grid
         
-        print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f} | PCR RMSE: {avg_pcr_rmse:.6f} | EC RMSE: {avg_ec_rmse:.6f} | Overall P-RMSE Decr: {prmse_overall:.2f}% | Grid P-RMSE: {avg_prmse_grid:.2f}%")
+        print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f} | EC ACC: {avg_ec_acc:.6f} | PCR RMSE: {avg_pcr_rmse:.6f} | EC RMSE: {avg_ec_rmse:.6f} | Overall P-RMSE Decr: {prmse_overall:.2f}% | Grid P-RMSE: {avg_prmse_grid:.2f}%")
         
         target_dates_by_lead[lead] = aligned_target_dates
         obs_results_by_lead[lead] = target_arr
@@ -400,10 +456,10 @@ def main():
     result_dates_str = np.array([d.strftime("%Y-%m-%d") for d in result_dates])
     np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_dates.npy"), result_dates_str)
     print("\n================ Multi-Lead Test Performance Summary ================")
-    print(f"  {'Lead':<6} | {'ACC':<10} | {'PCR RMSE':<10} | {'EC RMSE':<10} | {'P-RMSE Decr (Overall)':<22} | {'P-RMSE (Grid)':<12}")
-    print("-" * 85)
+    print(f"  {'Lead':<6} | {'PCR ACC':<10} | {'EC ACC':<10} | {'PCR RMSE':<10} | {'EC RMSE':<10} | {'P-RMSE Decr (Overall)':<22} | {'P-RMSE (Grid)':<12}")
+    print("-" * 97)
     for lead in sorted(lead_avg_accs.keys()):
-        print(f"  Lead-{lead:<1} | {lead_avg_accs[lead]:.6f} | {lead_avg_pcr_rmse[lead]:.6f} | {lead_avg_ec_rmse[lead]:.6f} | {lead_avg_prmse_overall[lead]:.2f}% | {lead_avg_prmse_grid[lead]:.2f}%")
+        print(f"  Lead-{lead:<1} | {lead_avg_accs[lead]:.6f} | {lead_avg_ec_accs[lead]:.6f} | {lead_avg_pcr_rmse[lead]:.6f} | {lead_avg_ec_rmse[lead]:.6f} | {lead_avg_prmse_overall[lead]:.2f}% | {lead_avg_prmse_grid[lead]:.2f}%")
     
 if __name__ == "__main__":
     main()
