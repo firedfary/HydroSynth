@@ -109,12 +109,39 @@ def main():
     hr_obs_full = np.load(hr_obs_path)  # [366, 120, 140]
     mask = ~np.isnan(hr_obs_full[0])
     
-    # Load SST
-    sst_path = config.modelconfig["sst_file"]
-    sst_full = np.load(sst_path)# [366, 6, 89，180]
-    if sst_full.ndim == 4:
-        sst_full = np.mean(sst_full, axis=1) # [366, 89, 180]
-    mask_sst = ~np.isnan(sst_full[0])
+    # Load SST config and paths
+    ersst_data_path = os.getenv("ERSST_DATA_PATH")
+    
+    # Calculate all ERSST dates needed across target dates and leads
+    all_sst_dates = set()
+    for target_date in valid_dates:
+        for lead in range(6):
+            issue_date = target_date - pd.DateOffset(months=lead)
+            for m in range(1, 7): # Preceding 6 months: issue_date - 1 month, ..., issue_date - 6 months
+                all_sst_dates.add(issue_date - pd.DateOffset(months=m))
+    all_sst_dates = sorted(list(all_sst_dates))
+    
+    print("\nPre-caching ERSST monthly files to memory...")
+    sst_cache = {}
+    mask_sst = None
+    for sst_date in tqdm.tqdm(all_sst_dates, desc="Caching SST files"):
+        ym_str = sst_date.strftime("%Y%m")
+        fname = f"ersst.v5.{ym_str}.nc"
+        fpath = os.path.join(ersst_data_path, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            ds = xr.open_dataset(fpath)
+            ssta = np.squeeze(ds['ssta'].values)
+            sst_cache[sst_date] = ssta
+            if mask_sst is None:
+                mask_sst = ~np.isnan(ssta)
+            ds.close()
+        except Exception as e:
+            print(f"Warning: Failed to load SST {fname}: {e}")
+            
+    if mask_sst is None:
+        raise ValueError("Error: Could not determine mask_sst as no SST files were loaded successfully.")
 
     # 2. Pre-cache all NC files to memory to avoid redundant disk I/O
     print("\nPre-caching ECMWF forecast files to memory...")
@@ -219,8 +246,15 @@ def main():
             cond_lead = modes_cache[issue_date][lead] # [10, 180, 360]
             cond_list.append(cond_lead)
             
-            # 2. SST
-            sst_list.append(sst_full[date_to_idx[target_date]])
+            # 2. SST (No leakage: relative to issue_date, preceding 6 months)
+            sst_seq = []
+            for m in range(6, 0, -1):
+                sst_date = issue_date - pd.DateOffset(months=m)
+                if sst_date in sst_cache:
+                    sst_seq.append(sst_cache[sst_date])
+                else:
+                    sst_seq.append(np.zeros_like(mask_sst, dtype=np.float32))
+            sst_list.append(np.stack(sst_seq)) # [6, 89, 180]
             
             # 3. Lags (Leak-free lagged persistence relative to target month T)
             lag_1 = target_date - pd.DateOffset(months=lead + 1)
@@ -240,7 +274,7 @@ def main():
             target_list.append(hr_obs_full[date_to_idx[target_date]])
             
         cond_arr = np.stack(cond_list)   # [N, 10, 180, 360]
-        sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)     # [N, 89, 180]
+        sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)     # [N, 6, 89, 180]
         lags_arr = np.nan_to_num(np.stack(lags_list), nan=0.0)   # [N, 4, 120, 140]
         target_arr = np.nan_to_num(np.stack(target_list), nan=0.0) # [N, 120, 140]
         
@@ -290,8 +324,11 @@ def main():
         months_cos = np.cos(2 * np.pi * target_months / 12.0)
         
         # Step C: Max Covariance Analysis (MCA)
-        # 1. SST MCA
-        le_sst, _ = compute_mca_np(sst_arr, target_arr, mask_sst, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
+        # 1. SST MCA (6 channels processed separately)
+        le_ssts = []
+        for ch in range(6):
+            le_sst_ch, _ = compute_mca_np(sst_arr[:, ch], target_arr, mask_sst, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
+            le_ssts.append(le_sst_ch)
         # Define global and regional forecast masks
         mask_cond_global = ~np.isnan(cond_norm[0, 0])
         mask_cond_regional = np.ones((60, 70), dtype=bool)
@@ -315,7 +352,7 @@ def main():
             le_lags.append(le_l)
             
         # Concatenate predictor PCs
-        predictor_pcs = np.concatenate([le_sst, months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
+        predictor_pcs = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
         X_train = predictor_pcs[:train_end]
         
         # Target PCA
