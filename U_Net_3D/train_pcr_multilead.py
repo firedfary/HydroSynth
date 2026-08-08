@@ -362,29 +362,8 @@ def main():
             le_l, _ = compute_mca_np(lags_norm[:, c], target_arr, mask, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
             le_lags.append(le_l)
             
-        # Concatenate base predictor PCs
-        X_base = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
-        
-        # Compress base PCs to 30 components first to avoid combinatorial explosion
-        n_base_compress = min(30, X_base.shape[1])
-        pca_base = PCA(n_components=n_base_compress)
-        pca_base.fit(X_base[:train_end])
-        X_base_reduced = pca_base.transform(X_base)
-        
-        # Perform pairwise polynomial expansion on the compressed PC space (~465 features)
-        from sklearn.preprocessing import PolynomialFeatures
-        poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-        poly.fit(X_base_reduced[:train_end])
-        X_poly = poly.transform(X_base_reduced)
-        
-        # Reduce the interaction space to 50 principal components
-        n_poly_pcs = min(50, X_poly.shape[1])
-        pca_poly = PCA(n_components=n_poly_pcs)
-        pca_poly.fit(X_poly[:train_end])
-        X_poly_reduced = pca_poly.transform(X_poly)
-        
-        # Combine original base PCs and interaction PCs
-        predictor_pcs = np.concatenate([X_base, X_poly_reduced], axis=1)
+        # Concatenate predictor PCs (directly using base PCs without manual polynomial expansion)
+        predictor_pcs = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
         X_train = predictor_pcs[:train_end]
         
         # Target PCA
