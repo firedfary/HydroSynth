@@ -167,7 +167,7 @@ def main():
             # Select 10 channels globally, and extract lead 0-5
             selected = ds[['tp', 'h200', 'h500', 'slp', 't2m', 't850', 'u200', 'u850', 'v200', 'v850']]
             # Extracted array shape: [6, 10, 180, 360] (time=slice(0, 6))
-            cond_data = selected.isel(time=slice(0, 6)).to_array().to_numpy() 
+            cond_data = selected.isel(time=slice(0, 6)).to_array().to_numpy().astype(np.float32)
             # Reorder dimensions from [10, 6, 180, 360] to [6, 10, 180, 360]
             cond_data = np.swapaxes(cond_data, 0, 1) # [6, 10, 180, 360]
             
@@ -244,7 +244,18 @@ def main():
             
             # 1. Forecast variables (Extracted from memory cache!)
             cond_lead = modes_cache[issue_date][lead] # [10, 180, 360]
-            cond_list.append(cond_lead)
+            
+            # Compute new physical variables:
+            # 10: low-level wind speed (u850=7, v850=9)
+            v850_speed = np.sqrt(cond_lead[7]**2 + cond_lead[9]**2)
+            # 11: high-level wind speed (u200=6, v200=8)
+            v200_speed = np.sqrt(cond_lead[6]**2 + cond_lead[8]**2)
+            # 12: vertical wind shear magnitude
+            wind_shear = np.sqrt((cond_lead[6] - cond_lead[7])**2 + (cond_lead[8] - cond_lead[9])**2)
+            
+            # Concatenate to 13 channels
+            cond_lead_ext = np.concatenate([cond_lead, v850_speed[None], v200_speed[None], wind_shear[None]], axis=0)
+            cond_list.append(cond_lead_ext)
             
             # 2. SST (No leakage: relative to issue_date, preceding 6 months)
             sst_seq = []
@@ -273,7 +284,7 @@ def main():
             # 4. Target
             target_list.append(hr_obs_full[date_to_idx[target_date]])
             
-        cond_arr = np.stack(cond_list)   # [N, 10, 180, 360]
+        cond_arr = np.stack(cond_list)   # [N, 13, 180, 360]
         sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)     # [N, 6, 89, 180]
         lags_arr = np.nan_to_num(np.stack(lags_list), nan=0.0)   # [N, 4, 120, 140]
         target_arr = np.nan_to_num(np.stack(target_list), nan=0.0) # [N, 120, 140]
@@ -293,7 +304,7 @@ def main():
         
         # Compute anomalies (fitted on train only to avoid leakage)
         cond_anom = np.zeros_like(cond_interp)
-        for c in range(10):
+        for c in range(13):
             for m in range(1, 13):
                 train_idx_m = np.where(train_months == m)[0]
                 all_idx_m = np.where(target_months == m)[0]
@@ -307,7 +318,7 @@ def main():
                     
         # Apply Z-score + 3-sigma DataNormalizer (fitted on train only)
         cond_norm = np.zeros_like(cond_anom)
-        for c in range(10):
+        for c in range(13):
             normalizer = DataNormalizer(clip_sigma=3.0)
             normalizer.fit(cond_anom[:train_end, c])
             cond_norm[:, c] = np.nan_to_num(normalizer.transform(cond_anom[:, c]), nan=0.0)
@@ -333,10 +344,10 @@ def main():
         mask_cond_global = ~np.isnan(cond_norm[0, 0])
         mask_cond_regional = np.ones((60, 70), dtype=bool)
 
-        # 2. 10 channels MCA (using regional mask for regional variables, global mask for global ones)
-        regional_channels = [0, 4, 5, 7, 9]  # tp, t2m, t850, u850, v850
+        # 2. 13 channels MCA (using regional mask for regional variables, global mask for global ones)
+        regional_channels = [0, 4, 5, 7, 9, 10, 11, 12]  # tp, t2m, t850, u850, v850, low-speed, high-speed, shear
         le_channels = []
-        for c in range(10):
+        for c in range(13):
             if c in regional_channels:
                 # Regional variables: Slice to China region [30:90, 70:140] and perform MCA
                 cond_norm_reg = cond_norm[:, c, 30:90, 70:140]
@@ -351,8 +362,29 @@ def main():
             le_l, _ = compute_mca_np(lags_norm[:, c], target_arr, mask, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
             le_lags.append(le_l)
             
-        # Concatenate predictor PCs
-        predictor_pcs = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
+        # Concatenate base predictor PCs
+        X_base = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
+        
+        # Compress base PCs to 30 components first to avoid combinatorial explosion
+        n_base_compress = min(30, X_base.shape[1])
+        pca_base = PCA(n_components=n_base_compress)
+        pca_base.fit(X_base[:train_end])
+        X_base_reduced = pca_base.transform(X_base)
+        
+        # Perform pairwise polynomial expansion on the compressed PC space (~465 features)
+        from sklearn.preprocessing import PolynomialFeatures
+        poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+        poly.fit(X_base_reduced[:train_end])
+        X_poly = poly.transform(X_base_reduced)
+        
+        # Reduce the interaction space to 50 principal components
+        n_poly_pcs = min(50, X_poly.shape[1])
+        pca_poly = PCA(n_components=n_poly_pcs)
+        pca_poly.fit(X_poly[:train_end])
+        X_poly_reduced = pca_poly.transform(X_poly)
+        
+        # Combine original base PCs and interaction PCs
+        predictor_pcs = np.concatenate([X_base, X_poly_reduced], axis=1)
         X_train = predictor_pcs[:train_end]
         
         # Target PCA
