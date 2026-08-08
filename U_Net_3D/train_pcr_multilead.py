@@ -45,7 +45,7 @@ def cal_acc_np(pred, target, mask):
             acc_list.append(cov / np.sqrt(var_p * var_t))
     return np.array(acc_list)
 
-def compute_mca_np(X, Y, mask_x, mask_y, n_components=3, fit_train_only=True, train_end=342):
+def compute_mca_np(X, Y, mask_x, mask_y, fit_train_only=True, train_end=342):
     T = X.shape[0]
     flat_x = X.reshape(T, -1)[:, mask_x.flatten()]
     flat_y = Y.reshape(T, -1)[:, mask_y.flatten()]
@@ -78,9 +78,9 @@ def compute_mca_np(X, Y, mask_x, mask_y, n_components=3, fit_train_only=True, tr
     
     U_m, s_m, Vt_m = np.linalg.svd(M, full_matrices=False)
     
-    # Recover truncated spatial patterns: U = V_x @ U_m and V = V_y @ V_m
-    U = Vt_x.T @ U_m[:, :n_components]
-    V = Vt_y.T @ Vt_m[:n_components, :].T
+    # Recover spatial patterns: U = Vt_x.T @ U_m and V = Vt_y.T @ Vt_m.T
+    U = Vt_x.T @ U_m
+    V = Vt_y.T @ Vt_m.T
     
     le = flat_x_centered @ U
     re = flat_y_centered @ V
@@ -91,7 +91,7 @@ def compute_mca_np(X, Y, mask_x, mask_y, n_components=3, fit_train_only=True, tr
         std_le = le.std(axis=0) + 1e-8
     le = le / std_le
     
-    return le, re
+    return le, re, s_m
 
 def main():
     print("================ Multi-Lead PCA-PCR Prediction Array System ================")
@@ -188,22 +188,20 @@ def main():
     target_dates_by_lead = {}
     # MCA/PCA Hyperparameters and settings
     lead_hyperparams = {
-        0: {"mca_pcs": 12, "target_pcs": 8, "sigma": 1.0},
-        1: {"mca_pcs": 11, "target_pcs": 7, "sigma": 1.5},
-        2: {"mca_pcs": 10, "target_pcs": 7, "sigma": 1.8},
-        3: {"mca_pcs": 9,  "target_pcs": 6, "sigma": 2.0},
-        4: {"mca_pcs": 7,  "target_pcs": 5, "sigma": 2.2},
-        5: {"mca_pcs": 6,  "target_pcs": 4, "sigma": 2.5}
+        0: {"sigma": 1.0},
+        1: {"sigma": 1.5},
+        2: {"sigma": 1.8},
+        3: {"sigma": 2.0},
+        4: {"sigma": 2.2},
+        5: {"sigma": 2.5}
     }
     alpha = 5.0
-    fit_on_full = True
+    fit_on_full = False
     num_test = 21
     
     # Loop over all 6 leads (Lead 0 to Lead 5)
     for lead in range(6):
         hparams = lead_hyperparams[lead]
-        mca_pcs = hparams["mca_pcs"]
-        target_pcs = hparams["target_pcs"]
         sigma = hparams["sigma"]
         print(f"\n>>> Processing Lead-{lead} Model training & evaluation...")
         
@@ -335,11 +333,16 @@ def main():
         months_cos = np.cos(2 * np.pi * target_months / 12.0)
         
         # Step C: Max Covariance Analysis (MCA)
-        # 1. SST MCA (6 channels processed separately)
+        # 1. SST MCA (6 channels processed separately, dynamic components explaining 80% covariance)
         le_ssts = []
         for ch in range(6):
-            le_sst_ch, _ = compute_mca_np(sst_arr[:, ch], target_arr, mask_sst, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
-            le_ssts.append(le_sst_ch)
+            le_sst_ch, _, s_m = compute_mca_np(sst_arr[:, ch], target_arr, mask_sst, mask, fit_train_only=not fit_on_full, train_end=train_end)
+            scf = s_m**2 / np.sum(s_m**2)
+            cum_scf = np.cumsum(scf)
+            n_comp = np.argmax(cum_scf >= 0.80) + 1
+            n_comp = np.clip(n_comp, 4, 12)
+            le_ssts.append(le_sst_ch[:, :n_comp])
+            
         # Define global and regional forecast masks
         mask_cond_global = ~np.isnan(cond_norm[0, 0])
         mask_cond_regional = np.ones((60, 70), dtype=bool)
@@ -351,42 +354,68 @@ def main():
             if c in regional_channels:
                 # Regional variables: Slice to China region [30:90, 70:140] and perform MCA
                 cond_norm_reg = cond_norm[:, c, 30:90, 70:140]
-                le_c, _ = compute_mca_np(cond_norm_reg, target_arr, mask_cond_regional, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
+                le_c, _, s_m = compute_mca_np(cond_norm_reg, target_arr, mask_cond_regional, mask, fit_train_only=not fit_on_full, train_end=train_end)
             else:
                 # Global variables: Perform MCA on global native resolution
-                le_c, _ = compute_mca_np(cond_norm[:, c], target_arr, mask_cond_global, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
-            le_channels.append(le_c)
+                le_c, _, s_m = compute_mca_np(cond_norm[:, c], target_arr, mask_cond_global, mask, fit_train_only=not fit_on_full, train_end=train_end)
+            scf = s_m**2 / np.sum(s_m**2)
+            cum_scf = np.cumsum(scf)
+            n_comp = np.argmax(cum_scf >= 0.80) + 1
+            n_comp = np.clip(n_comp, 4, 12)
+            le_channels.append(le_c[:, :n_comp])
+            
         # 3. 4 Lags MCA
         le_lags = []
         for c in range(4):
-            le_l, _ = compute_mca_np(lags_norm[:, c], target_arr, mask, mask, n_components=mca_pcs, fit_train_only=not fit_on_full, train_end=train_end)
-            le_lags.append(le_l)
+            le_l, _, s_m = compute_mca_np(lags_norm[:, c], target_arr, mask, mask, fit_train_only=not fit_on_full, train_end=train_end)
+            scf = s_m**2 / np.sum(s_m**2)
+            cum_scf = np.cumsum(scf)
+            n_comp = np.argmax(cum_scf >= 0.80) + 1
+            n_comp = np.clip(n_comp, 4, 12)
+            le_lags.append(le_l[:, :n_comp])
             
         # Concatenate predictor PCs (directly using base PCs without manual polynomial expansion)
         predictor_pcs = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
         X_train = predictor_pcs[:train_end]
         
-        # Target PCA
-        pca_target = PCA(n_components=target_pcs)
+        # Target PCA (explaining 80% of target variance, strictly leak-free)
+        pca_target = PCA(n_components=0.80, svd_solver='full')
         if fit_on_full:
             pca_target.fit(target_arr[:, mask])
             y_train_pcs = pca_target.transform(target_arr[:train_end][:, mask])
         else:
-            y_train_pcs = pca_target.fit_transform(target_arr[:train_end][:, mask])
+            pca_target.fit(target_arr[:train_end][:, mask])
+            y_train_pcs = pca_target.transform(target_arr[:train_end][:, mask])
+            
+        target_pcs = pca_target.n_components_
             
         # Define base models creator
         def get_base_models():
+            from sklearn.linear_model import Lasso, Ridge
+            from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
+            from xgboost import XGBRegressor
+            from lightgbm import LGBMRegressor
+            
             return {
-                "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+                "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=1000, tol=1e-3),
+                "Lasso": Lasso(alpha=0.01, max_iter=1000, tol=1e-3),
+                "Ridge": Ridge(alpha=1.0, max_iter=1000, tol=1e-3),
                 "KernelRidge_Poly": KernelRidge(alpha=1.0, kernel='poly', degree=2),
                 "SVR_RBF": MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
-                "RandomForest": RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1)
+                "RandomForest": RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
+                "ExtraTrees": ExtraTreesRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
+                "HistGradientBoosting": MultiOutputRegressor(HistGradientBoostingRegressor(max_iter=100, max_depth=5, random_state=42)),
+                "XGBoost": MultiOutputRegressor(XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1)),
+                "LightGBM": MultiOutputRegressor(LGBMRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1, verbose=-1))
             }
             
+        base_models_dict = get_base_models()
+        model_names = list(base_models_dict.keys())
+        num_models = len(model_names)
+        
         # Perform 5-Fold Cross-Validation on training set to obtain Out-Of-Fold (OOF) predictions
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        oof_preds = np.zeros((train_end, target_pcs, 4))
-        model_names = ["ElasticNet", "KernelRidge_Poly", "SVR_RBF", "RandomForest"]
+        oof_preds = np.zeros((train_end, target_pcs, num_models))
         
         for train_idx, val_idx in kf.split(X_train):
             X_tr, X_val = X_train[train_idx], X_train[val_idx]
@@ -399,14 +428,16 @@ def main():
                 
         # Learn meta-regressor weights using Ridge to combine base models robustly
         # Flatten OOF predictions and training targets along samples and PC dimensions
-        X_meta = oof_preds.reshape(-1, 4)
+        X_meta = oof_preds.reshape(-1, num_models)
         y_meta = y_train_pcs.reshape(-1)
         
-        meta_regressor = Ridge(alpha=10.0, fit_intercept=False)
+        meta_regressor = Ridge(alpha=10.0, fit_intercept=False, positive=True)
         meta_regressor.fit(X_meta, y_meta)
         weights = meta_regressor.coef_
         
-        print(f"Lead-{lead} Stacking weights: EN={weights[0]:.4f}, KR={weights[1]:.4f}, SVR={weights[2]:.4f}, RF={weights[3]:.4f}")
+        # Print stacking weights
+        weight_str = ", ".join([f"{name}={weights[idx]:.4f}" for idx, name in enumerate(model_names)])
+        print(f"Lead-{lead} Stacking weights: {weight_str}")
         
         # Train base models on the FULL training set
         ensemble_models = get_base_models()
@@ -418,7 +449,7 @@ def main():
         for name, model in ensemble_models.items():
             preds_pcs_list.append(model.predict(predictor_pcs))
             
-        preds_pcs_stacked = np.stack(preds_pcs_list, axis=2) # [N, target_pcs, 4]
+        preds_pcs_stacked = np.stack(preds_pcs_list, axis=2) # [N, target_pcs, num_models]
         pred_all_pcs = preds_pcs_stacked @ weights # [N, target_pcs]
         
         pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
