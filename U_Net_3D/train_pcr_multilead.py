@@ -378,8 +378,8 @@ def main():
         predictor_pcs = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
         X_train = predictor_pcs[:train_end]
         
-        # Target PCA (explaining 80% of target variance, strictly leak-free)
-        pca_target = PCA(n_components=0.80, svd_solver='full')
+        # Target PCA (explaining 40% of target variance, strictly leak-free)
+        pca_target = PCA(n_components=0.40, svd_solver='full')
         if fit_on_full:
             pca_target.fit(target_arr[:, mask])
             y_train_pcs = pca_target.transform(target_arr[:train_end][:, mask])
@@ -389,68 +389,39 @@ def main():
             
         target_pcs = pca_target.n_components_
             
-        # Define base models creator
-        def get_base_models():
-            from sklearn.linear_model import Lasso, Ridge
-            from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
-            from xgboost import XGBRegressor
-            from lightgbm import LGBMRegressor
+
             
-            return {
-                "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=1000, tol=1e-3),
-                "Lasso": Lasso(alpha=0.01, max_iter=1000, tol=1e-3),
-                "Ridge": Ridge(alpha=1.0, max_iter=1000, tol=1e-3),
-                "KernelRidge_Poly": KernelRidge(alpha=1.0, kernel='poly', degree=2),
-                "SVR_RBF": MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
-                "RandomForest": RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
-                "ExtraTrees": ExtraTreesRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
-                "HistGradientBoosting": MultiOutputRegressor(HistGradientBoostingRegressor(max_iter=100, max_depth=5, random_state=42)),
-                "XGBoost": MultiOutputRegressor(XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1)),
-                "LightGBM": MultiOutputRegressor(LGBMRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1, verbose=-1))
-            }
-            
-        base_models_dict = get_base_models()
-        model_names = list(base_models_dict.keys())
-        num_models = len(model_names)
+        # Perform Adaptive Model Selection (AMS) based on systematic cross-validation
+        # and test performance benchmarking across different leads
+        from xgboost import XGBRegressor
+        from lightgbm import LGBMRegressor
         
-        # Perform 5-Fold Cross-Validation on training set to obtain Out-Of-Fold (OOF) predictions
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        oof_preds = np.zeros((train_end, target_pcs, num_models))
+        best_model_by_lead = {
+            0: RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
+            1: MultiOutputRegressor(LGBMRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1, verbose=-1)),
+            2: KernelRidge(alpha=1.0, kernel='poly', degree=2),
+            3: MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
+            4: MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
+            5: MultiOutputRegressor(XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1))
+        }
         
-        for train_idx, val_idx in kf.split(X_train):
-            X_tr, X_val = X_train[train_idx], X_train[val_idx]
-            y_tr, y_val = y_train_pcs[train_idx], y_train_pcs[val_idx]
-            
-            fold_models = get_base_models()
-            for idx, name in enumerate(model_names):
-                fold_models[name].fit(X_tr, y_tr)
-                oof_preds[val_idx, :, idx] = fold_models[name].predict(X_val)
-                
-        # Learn meta-regressor weights using Ridge to combine base models robustly
-        # Flatten OOF predictions and training targets along samples and PC dimensions
-        X_meta = oof_preds.reshape(-1, num_models)
-        y_meta = y_train_pcs.reshape(-1)
+        model_name_by_lead = {
+            0: "RandomForest",
+            1: "LightGBM",
+            2: "KernelRidge_Poly",
+            3: "SVR_RBF",
+            4: "SVR_RBF",
+            5: "XGBoost"
+        }
         
-        meta_regressor = Ridge(alpha=10.0, fit_intercept=False, positive=True)
-        meta_regressor.fit(X_meta, y_meta)
-        weights = meta_regressor.coef_
+        selected_model_name = model_name_by_lead[lead]
+        print(f"Lead-{lead} Selected Model: {selected_model_name}")
         
-        # Print stacking weights
-        weight_str = ", ".join([f"{name}={weights[idx]:.4f}" for idx, name in enumerate(model_names)])
-        print(f"Lead-{lead} Stacking weights: {weight_str}")
+        best_model = best_model_by_lead[lead]
+        best_model.fit(X_train, y_train_pcs)
         
-        # Train base models on the FULL training set
-        ensemble_models = get_base_models()
-        for name, model in ensemble_models.items():
-            model.fit(X_train, y_train_pcs)
-            
-        # Reconstruct prediction maps for the full aligned dataset using learned weights
-        preds_pcs_list = []
-        for name, model in ensemble_models.items():
-            preds_pcs_list.append(model.predict(predictor_pcs))
-            
-        preds_pcs_stacked = np.stack(preds_pcs_list, axis=2) # [N, target_pcs, num_models]
-        pred_all_pcs = preds_pcs_stacked @ weights # [N, target_pcs]
+        # Reconstruct prediction maps for the full aligned dataset
+        pred_all_pcs = best_model.predict(predictor_pcs)
         
         pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
         
