@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.decomposition import PCA
 from sklearn.kernel_ridge import KernelRidge
@@ -27,6 +29,7 @@ if _project_parent not in sys.path:
 from HydroSynth.utils import utils
 from HydroSynth.utils.observe_norm import DataNormalizer
 from HydroSynth import config
+from U_Net_model.unetlitefilm import UNetLiteFiLM
 
 def cal_acc_np(pred, target, mask):
     N, H, W = pred.shape
@@ -93,8 +96,82 @@ def compute_mca_np(X, Y, mask_x, mask_y, fit_train_only=True, train_end=342):
     
     return le, re, s_m
 
+class FiLMUNetWrapper:
+    """
+    Wrapper for UNetLiteFiLM to provide unified fit and predict interface.
+    """
+    def __init__(self, in_channels=17, index_dim=50, base_filters=16, dropout=0.1, lr=1e-3, epochs=35, batch_size=16, device=None, mask=None):
+        self.in_channels = in_channels
+        self.index_dim = index_dim
+        self.base_filters = base_filters
+        self.dropout = dropout
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.mask = mask
+        self.model = None
+
+    def fit(self, X_spatial, X_pcs, y_spatial):
+        torch.manual_seed(42)
+        np.random.seed(42)
+        
+        self.model = UNetLiteFiLM(
+            n_channels=self.in_channels,
+            n_classes=1,
+            index_dim=self.index_dim,
+            base_filters=self.base_filters,
+            dropout=self.dropout
+        ).to(self.device)
+        
+        X_sp_t = torch.from_numpy(X_spatial.astype(np.float32))
+        X_pc_t = torch.from_numpy(X_pcs.astype(np.float32))
+        y_sp_t = torch.from_numpy(y_spatial.astype(np.float32)).unsqueeze(1)  # [N, 1, H, W]
+        
+        dataset = TensorDataset(X_sp_t, X_pc_t, y_sp_t)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-5)
+        loss_fn = nn.MSELoss()
+        
+        mask_t = torch.from_numpy(self.mask).to(self.device) if self.mask is not None else None
+        
+        self.model.train()
+        for epoch in range(self.epochs):
+            for xb, pb, yb in loader:
+                xb, pb, yb = xb.to(self.device), pb.to(self.device), yb.to(self.device)
+                optimizer.zero_grad()
+                out = self.model(xb, pb)  # [B, 1, H, W]
+                if mask_t is not None:
+                    loss = loss_fn(out[:, 0][:, mask_t], yb[:, 0][:, mask_t])
+                else:
+                    loss = loss_fn(out, yb)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+            scheduler.step()
+        return self
+
+    def predict(self, X_spatial, X_pcs):
+        self.model.eval()
+        preds = []
+        with torch.no_grad():
+            for i in range(0, len(X_spatial), self.batch_size):
+                xb = torch.from_numpy(X_spatial[i:i+self.batch_size].astype(np.float32)).to(self.device)
+                pb = torch.from_numpy(X_pcs[i:i+self.batch_size].astype(np.float32)).to(self.device)
+                out = self.model(xb, pb)  # [B, 1, H, W]
+                preds.append(out.squeeze(1).cpu().numpy())
+        pred_arr = np.concatenate(preds, axis=0)  # [N, H, W]
+        if self.mask is not None:
+            pred_arr[:, ~self.mask] = 0.0
+        return pred_arr
+
 def main():
-    print("================ Multi-Lead PCA-PCR Prediction Array System ================")
+    print("================ Multi-Lead Spatio-Temporal AMS Prediction System (FiLM-UNet + PCR) ================")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Active Computation Device: {device}")
+    
     data_dir = config.modelconfig['base_data_path']
     modes_data_path = os.getenv("MODESV21_DATA_PATH")
     
@@ -102,7 +179,7 @@ def main():
     all_dates = pd.date_range(start='1994-01-01', end='2024-09-01', freq='MS')
     exclude_dates = [pd.to_datetime(d) for d in ['2017-01-01', '2011-09-01', '2011-10-01']]
     valid_dates = [d for d in all_dates if d not in exclude_dates]
-    date_to_idx = {d: i for i, d in enumerate(valid_dates)} #366
+    date_to_idx = {d: i for i, d in enumerate(valid_dates)}  # 366
     
     # Load High-Resolution Observation grid
     hr_obs_path = os.path.join(config.modelconfig['hr_path'], 'hr_data.npy')
@@ -117,7 +194,7 @@ def main():
     for target_date in valid_dates:
         for lead in range(6):
             issue_date = target_date - pd.DateOffset(months=lead)
-            for m in range(1, 7): # Preceding 6 months: issue_date - 1 month, ..., issue_date - 6 months
+            for m in range(1, 7):  # Preceding 6 months
                 all_sst_dates.add(issue_date - pd.DateOffset(months=m))
     all_sst_dates = sorted(list(all_sst_dates))
     
@@ -147,8 +224,7 @@ def main():
     print("\nPre-caching ECMWF forecast files to memory...")
     modes_cache = {}
     
-    # Find all issue dates needed for all possible valid target dates and leads
-    all_issue_dates = sorted(list({ # 1993.08-01 to 2024.09-01, 374 months,起报日期，下面的模式数据读取的就是这个日期
+    all_issue_dates = sorted(list({
         target_date - pd.DateOffset(months=lead)
         for target_date in valid_dates
         for lead in range(6)
@@ -166,11 +242,8 @@ def main():
             ds = xr.open_dataset(fpath)
             # Select 10 channels globally, and extract lead 0-5
             selected = ds[['tp', 'h200', 'h500', 'slp', 't2m', 't850', 'u200', 'u850', 'v200', 'v850']]
-            # Extracted array shape: [6, 10, 180, 360] (time=slice(0, 6))
             cond_data = selected.isel(time=slice(0, 6)).to_array().to_numpy().astype(np.float32)
-            # Reorder dimensions from [10, 6, 180, 360] to [6, 10, 180, 360]
-            cond_data = np.swapaxes(cond_data, 0, 1) # [6, 10, 180, 360]
-            
+            cond_data = np.swapaxes(cond_data, 0, 1)  # [6, 10, 180, 360]
             modes_cache[issue_date] = cond_data
             ds.close()
         except Exception as e:
@@ -182,10 +255,13 @@ def main():
     lead_avg_ec_rmse = {}
     lead_avg_prmse_overall = {}
     lead_avg_prmse_grid = {}
+    selected_model_by_lead = {}
+    best_cv_score_by_lead = {}
     obs_results_by_lead = {}
     ec_precip_anom_results_by_lead = {}
     predict_results_by_lead = {}
     target_dates_by_lead = {}
+    
     # MCA/PCA Hyperparameters and settings
     lead_hyperparams = {
         0: {"sigma": 1.0},
@@ -195,7 +271,6 @@ def main():
         4: {"sigma": 2.2},
         5: {"sigma": 2.5}
     }
-    alpha = 5.0
     fit_on_full = False
     num_test = 21
     
@@ -203,18 +278,18 @@ def main():
     for lead in range(6):
         hparams = lead_hyperparams[lead]
         sigma = hparams["sigma"]
-        print(f"\n>>> Processing Lead-{lead} Model training & evaluation...")
+        print(f"\n==================== Processing Lead-{lead} Model Training & AMS ====================")
         
         # Step A: Find aligned target dates for Lead-L without leakage
         aligned_target_dates = []
-        for target_date in valid_dates: #199401-202409，366
+        for target_date in valid_dates:
             issue_date = target_date - pd.DateOffset(months=lead)
             if issue_date not in modes_cache:
                 continue
             
             # Check lag persistence availability
             lag_dates = [
-                target_date - pd.DateOffset(months=lead + 1), # 如果要预报1994年1月，需要1994年1月的模式数据+93年12月、11月、10月、1月观测
+                target_date - pd.DateOffset(months=lead + 1),
                 target_date - pd.DateOffset(months=lead + 2),
                 target_date - pd.DateOffset(months=lead + 3),
                 target_date - pd.DateOffset(months=12)
@@ -222,7 +297,7 @@ def main():
             if any(ld not in date_to_idx for ld in lag_dates):
                 continue
                 
-            aligned_target_dates.append(target_date) # 预测目标，从1995年1月到2024年9月，共345个月
+            aligned_target_dates.append(target_date)
             
         N = len(aligned_target_dates)
         if N <= num_test:
@@ -240,8 +315,8 @@ def main():
         for target_date in aligned_target_dates:
             issue_date = target_date - pd.DateOffset(months=lead)
             
-            # 1. Forecast variables (Extracted from memory cache!)
-            cond_lead = modes_cache[issue_date][lead] # [10, 180, 360]
+            # 1. Forecast variables (Extracted from memory cache)
+            cond_lead = modes_cache[issue_date][lead]  # [10, 180, 360]
             
             # Compute new physical variables:
             # 10: low-level wind speed (u850=7, v850=9)
@@ -263,7 +338,7 @@ def main():
                     sst_seq.append(sst_cache[sst_date])
                 else:
                     sst_seq.append(np.zeros_like(mask_sst, dtype=np.float32))
-            sst_list.append(np.stack(sst_seq)) # [6, 89, 180]
+            sst_list.append(np.stack(sst_seq))  # [6, 89, 180]
             
             # 3. Lags (Leak-free lagged persistence relative to target month T)
             lag_1 = target_date - pd.DateOffset(months=lead + 1)
@@ -277,22 +352,19 @@ def main():
                 hr_obs_full[date_to_idx[lag_3]],
                 hr_obs_full[date_to_idx[lag_12]]
             ]
-            lags_list.append(np.stack(lags)) # [4, 120, 140]
+            lags_list.append(np.stack(lags))  # [4, 120, 140]
             
             # 4. Target
             target_list.append(hr_obs_full[date_to_idx[target_date]])
             
         cond_arr = np.stack(cond_list)   # [N, 13, 180, 360]
-        sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)     # [N, 6, 89, 180]
-        lags_arr = np.nan_to_num(np.stack(lags_list), nan=0.0)   # [N, 4, 120, 140]
-        target_arr = np.nan_to_num(np.stack(target_list), nan=0.0) # [N, 120, 140]
+        sst_arr = np.nan_to_num(np.stack(sst_list), nan=0.0)      # [N, 6, 89, 180]
+        lags_arr = np.nan_to_num(np.stack(lags_list), nan=0.0)    # [N, 4, 120, 140]
+        target_arr = np.nan_to_num(np.stack(target_list), nan=0.0)  # [N, 120, 140]
         
-        # Process global forecast fields directly at their native resolution [N, 10, 180, 360]
+        # Process global forecast fields
         cond_interp = cond_arr.copy()
-        
-        # Convert precip forecast to mm/month
-        cond_interp[:, 0] = cond_interp[:, 0] * 31*24*60*60*1000
-        # Zero-clipping for precipitation to prevent negative forecast anomalies
+        cond_interp[:, 0] = cond_interp[:, 0] * 31 * 24 * 60 * 60 * 1000  # mm/month
         cond_interp[:, 0] = np.clip(cond_interp[:, 0], 0.0, None)
         
         # Train/Test boundaries
@@ -309,7 +381,7 @@ def main():
                 if len(train_idx_m) == 0:
                     continue
                 clim = cond_interp[train_idx_m, c].mean(axis=0)
-                if c == 0: # percent anomaly
+                if c == 0:  # percent anomaly
                     cond_anom[all_idx_m, c] = (cond_interp[all_idx_m, c] - clim) / (cond_interp[train_idx_m, c].mean(axis=0) + 1e-6)
                 else:
                     cond_anom[all_idx_m, c] = cond_interp[all_idx_m, c] - clim
@@ -328,6 +400,12 @@ def main():
             normalizer_lag.fit(lags_arr[:train_end, c])
             lags_norm[:, c] = np.nan_to_num(normalizer_lag.transform(lags_arr[:, c]), nan=0.0)
             
+        # Construct 17-channel spatial feature tensor for FiLM-UNet
+        cond_reg = cond_norm[:, :, 30:90, 70:140]  # [N, 13, 60, 70]
+        cond_reg_tensor = torch.from_numpy(cond_reg)
+        cond_reg_interp = F.interpolate(cond_reg_tensor, size=(120, 140), mode='bicubic', align_corners=True).numpy()  # [N, 13, 120, 140]
+        spatial_arr = np.concatenate([cond_reg_interp, lags_norm], axis=1)  # [N, 17, 120, 140]
+        
         # Climatology Target dates sin/cos
         months_sin = np.sin(2 * np.pi * target_months / 12.0)
         months_cos = np.cos(2 * np.pi * target_months / 12.0)
@@ -347,16 +425,14 @@ def main():
         mask_cond_global = ~np.isnan(cond_norm[0, 0])
         mask_cond_regional = np.ones((60, 70), dtype=bool)
 
-        # 2. 13 channels MCA (using regional mask for regional variables, global mask for global ones)
-        regional_channels = [0, 4, 5, 7, 9, 10, 11, 12]  # tp, t2m, t850, u850, v850, low-speed, high-speed, shear
+        # 2. 13 channels MCA
+        regional_channels = [0, 4, 5, 7, 9, 10, 11, 12]
         le_channels = []
         for c in range(13):
             if c in regional_channels:
-                # Regional variables: Slice to China region [30:90, 70:140] and perform MCA
                 cond_norm_reg = cond_norm[:, c, 30:90, 70:140]
                 le_c, _, s_m = compute_mca_np(cond_norm_reg, target_arr, mask_cond_regional, mask, fit_train_only=not fit_on_full, train_end=train_end)
             else:
-                # Global variables: Perform MCA on global native resolution
                 le_c, _, s_m = compute_mca_np(cond_norm[:, c], target_arr, mask_cond_global, mask, fit_train_only=not fit_on_full, train_end=train_end)
             scf = s_m**2 / np.sum(s_m**2)
             cum_scf = np.cumsum(scf)
@@ -374,82 +450,119 @@ def main():
             n_comp = np.clip(n_comp, 4, 12)
             le_lags.append(le_l[:, :n_comp])
             
-        # Concatenate predictor PCs (directly using base PCs without manual polynomial expansion)
+        # Concatenate predictor PCs (used for ML models and FiLM indices)
         predictor_pcs = np.concatenate(le_ssts + [months_sin[:, None], months_cos[:, None]] + le_channels + le_lags, axis=1)
-        X_train = predictor_pcs[:train_end]
+        index_dim = predictor_pcs.shape[1]
         
-        # Target PCA (explaining 40% of target variance, strictly leak-free)
+        # Training data slices
+        X_train_pcs = predictor_pcs[:train_end]
+        X_train_spatial = spatial_arr[:train_end]
+        y_train_spatial = target_arr[:train_end]
+        
+        # Target PCA (explaining 40% of target variance)
         pca_target = PCA(n_components=0.40, svd_solver='full')
-        if fit_on_full:
-            pca_target.fit(target_arr[:, mask])
-            y_train_pcs = pca_target.transform(target_arr[:train_end][:, mask])
-        else:
-            pca_target.fit(target_arr[:train_end][:, mask])
-            y_train_pcs = pca_target.transform(target_arr[:train_end][:, mask])
-            
-        target_pcs = pca_target.n_components_
-            
-
-            
-        # Perform Adaptive Model Selection (AMS) based on systematic cross-validation
-        # and test performance benchmarking across different leads
+        pca_target.fit(y_train_spatial[:, mask])
+        y_train_pcs = pca_target.transform(y_train_spatial[:, mask])
+        
+        print(f"Predictor PCs dimension: {index_dim} | Target PCA components: {pca_target.n_components_}")
+        
+        # Step D: Adaptive Model Selection (AMS) via 5-Fold Cross-Validation
         from xgboost import XGBRegressor
         from lightgbm import LGBMRegressor
         
-        best_model_by_lead = {
-            0: RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
-            1: MultiOutputRegressor(LGBMRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1, verbose=-1)),
-            2: KernelRidge(alpha=1.0, kernel='poly', degree=2),
-            3: MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
-            4: MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
-            5: MultiOutputRegressor(XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1))
+        candidate_models_factories = {
+            "FiLM_UNet": lambda: FiLMUNetWrapper(
+                in_channels=17,
+                index_dim=index_dim,
+                base_filters=16,
+                dropout=0.1,
+                lr=1e-3,
+                epochs=35,
+                batch_size=16,
+                device=device,
+                mask=mask
+            ),
+            "RandomForest": lambda: RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1),
+            "LightGBM": lambda: MultiOutputRegressor(LGBMRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1, verbose=-1)),
+            "XGBoost": lambda: MultiOutputRegressor(XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, n_jobs=-1)),
+            "KernelRidge_Poly": lambda: KernelRidge(alpha=1.0, kernel='poly', degree=2),
+            "SVR_RBF": lambda: MultiOutputRegressor(SVR(kernel='rbf', C=10.0, epsilon=0.1)),
+            "Ridge": lambda: Ridge(alpha=5.0)
         }
         
-        model_name_by_lead = {
-            0: "RandomForest",
-            1: "LightGBM",
-            2: "KernelRidge_Poly",
-            3: "SVR_RBF",
-            4: "SVR_RBF",
-            5: "XGBoost"
-        }
+        print(f"\n--- Running AMS 5-Fold Cross-Validation for Lead-{lead} ---")
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        cv_scores = {name: [] for name in candidate_models_factories.keys()}
         
-        selected_model_name = model_name_by_lead[lead]
-        print(f"Lead-{lead} Selected Model: {selected_model_name}")
+        for fold, (trn_idx, val_idx) in enumerate(kf.split(X_train_pcs)):
+            # Fit PCA on training fold only
+            pca_fold = PCA(n_components=0.40, svd_solver='full')
+            pca_fold.fit(y_train_spatial[trn_idx][:, mask])
+            y_trn_pcs_fold = pca_fold.transform(y_train_spatial[trn_idx][:, mask])
+            
+            for name, factory in candidate_models_factories.items():
+                m = factory()
+                if name == "FiLM_UNet":
+                    m.fit(X_train_spatial[trn_idx], X_train_pcs[trn_idx], y_train_spatial[trn_idx])
+                    pred_val = m.predict(X_train_spatial[val_idx], X_train_pcs[val_idx])
+                else:
+                    m.fit(X_train_pcs[trn_idx], y_trn_pcs_fold)
+                    pred_val_pcs = m.predict(X_train_pcs[val_idx])
+                    pred_val_flat = pca_fold.inverse_transform(pred_val_pcs)
+                    pred_val = np.zeros((len(val_idx), 120, 140), dtype=np.float32)
+                    pred_val[:, mask] = pred_val_flat
+                    
+                # Smooth validation predictions for evaluation
+                pred_val_smoothed = np.zeros_like(pred_val)
+                for i in range(len(val_idx)):
+                    pred_val_smoothed[i] = gaussian_filter(pred_val[i], sigma=sigma)
+                pred_val_smoothed[:, ~mask] = 0.0
+                
+                fold_acc = np.mean(cal_acc_np(pred_val_smoothed, y_train_spatial[val_idx], mask))
+                cv_scores[name].append(fold_acc)
+                
+        mean_cv_acc = {name: np.mean(scores) for name, scores in cv_scores.items()}
+        for name, score in sorted(mean_cv_acc.items(), key=lambda x: x[1], reverse=True):
+            print(f"  Candidate: {name:<18} | 5-Fold CV Mean ACC: {score:.5f}")
+            
+        best_model_name = max(mean_cv_acc, key=mean_cv_acc.get)
+        best_cv_score = mean_cv_acc[best_model_name]
+        selected_model_by_lead[lead] = best_model_name
+        best_cv_score_by_lead[lead] = best_cv_score
+        print(f">>> AMS Selected Best Model for Lead-{lead}: {best_model_name} (CV ACC: {best_cv_score:.5f})")
         
-        best_model = best_model_by_lead[lead]
-        best_model.fit(X_train, y_train_pcs)
-        
-        # Reconstruct prediction maps for the full aligned dataset
-        pred_all_pcs = best_model.predict(predictor_pcs)
-        
-        pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
-        
-        pred_all_recon = np.zeros_like(target_arr)
-        pred_all_recon[:, mask] = pred_all_flat
-        
+        # Step E: Full Training of Selected Best Model
+        best_model = candidate_models_factories[best_model_name]()
+        if best_model_name == "FiLM_UNet":
+            best_model.fit(X_train_spatial, X_train_pcs, y_train_spatial)
+            pred_all_recon = best_model.predict(spatial_arr, predictor_pcs)
+        else:
+            best_model.fit(X_train_pcs, y_train_pcs)
+            pred_all_pcs = best_model.predict(predictor_pcs)
+            pred_all_flat = pca_target.inverse_transform(pred_all_pcs)
+            pred_all_recon = np.zeros_like(target_arr)
+            pred_all_recon[:, mask] = pred_all_flat
+            
         pred_all_smoothed = np.zeros_like(pred_all_recon)
         for i in range(N):
             pred_all_smoothed[i] = gaussian_filter(pred_all_recon[i], sigma=sigma)
         pred_all_smoothed[:, ~mask] = 0.0
         pred_test_smoothed = pred_all_smoothed[train_end:]
         
-        # Slice global precip anomaly cond_anom[:, 0] (shape [N, 180, 360]) to China region
-        # latitude index 30:90, longitude index 70:140, then interpolate to [120, 140]
+        # Slice global precip anomaly for baseline comparison
         cond_anom_china = cond_anom[:, 0, 30:90, 70:140]
         cond_anom_china_tensor = torch.from_numpy(cond_anom_china[:, None])
         cond_anom_china_interp = F.interpolate(cond_anom_china_tensor, size=(120, 140), mode='bicubic').numpy()[:, 0]
         
-        # Retrieve test actual observations and EC seas baseline
-        obs_test = target_arr[train_end:] # [21, 120, 140]
-        mod_test = cond_anom_china_interp[train_end:] # EC Seas anomaly [21, 120, 140]
+        # Retrieve test actual observations and EC baseline
+        obs_test = target_arr[train_end:]  # [21, 120, 140]
+        mod_test = cond_anom_china_interp[train_end:]  # EC anomaly [21, 120, 140]
         
         # 1. Evaluate ACC
         test_accs = cal_acc_np(pred_test_smoothed, obs_test, mask)
         avg_acc = np.mean(test_accs)
         lead_avg_accs[lead] = avg_acc
         
-        # 1b. Evaluate EC ACC
         test_ec_accs = cal_acc_np(mod_test, obs_test, mask)
         avg_ec_acc = np.mean(test_ec_accs)
         lead_avg_ec_accs[lead] = avg_ec_acc
@@ -467,10 +580,7 @@ def main():
         avg_pcr_rmse = np.mean(pre_rmse_masked)
         avg_ec_rmse = np.mean(mod_rmse_masked)
         
-        # Overall P-RMSE Decrease Rate
         prmse_overall = ((avg_ec_rmse - avg_pcr_rmse) / (avg_ec_rmse + 1e-8)) * 100
-        
-        # Grid-point wise average P-RMSE Decrease Rate
         prmse_grid_masked = ((mod_rmse_masked - pre_rmse_masked) / (mod_rmse_masked + 1e-8)) * 100
         avg_prmse_grid = np.mean(prmse_grid_masked)
         
@@ -479,13 +589,14 @@ def main():
         lead_avg_prmse_overall[lead] = prmse_overall
         lead_avg_prmse_grid[lead] = avg_prmse_grid
         
-        print(f"Lead-{lead} Average Test ACC: {avg_acc:.6f} | EC ACC: {avg_ec_acc:.6f} | PCR RMSE: {avg_pcr_rmse:.6f} | EC RMSE: {avg_ec_rmse:.6f} | Overall P-RMSE Decr: {prmse_overall:.2f}% | Grid P-RMSE: {avg_prmse_grid:.2f}%")
+        print(f"Lead-{lead} [{best_model_name}] Average Test ACC: {avg_acc:.6f} | EC ACC: {avg_ec_acc:.6f} | Model RMSE: {avg_pcr_rmse:.6f} | EC RMSE: {avg_ec_rmse:.6f} | Overall P-RMSE Decr: {prmse_overall:.2f}% | Grid P-RMSE: {avg_prmse_grid:.2f}%")
         
         target_dates_by_lead[lead] = aligned_target_dates
         obs_results_by_lead[lead] = target_arr
         ec_precip_anom_results_by_lead[lead] = cond_anom_china_interp
         predict_results_by_lead[lead] = pred_all_smoothed
     
+    # Save multi-lead arrays
     result_dates = sorted({d for dates in target_dates_by_lead.values() for d in dates})
     result_date_to_idx = {d: i for i, d in enumerate(result_dates)}
     result_shape = (len(result_dates), 6, 120, 140)
@@ -505,11 +616,12 @@ def main():
     np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_predict_results.npy"), predict_results)
     result_dates_str = np.array([d.strftime("%Y-%m-%d") for d in result_dates])
     np.save(os.path.join(config.modelconfig['base_data_path'], "multi_lead_dates.npy"), result_dates_str)
-    print("\n================ Multi-Lead Test Performance Summary ================")
-    print(f"  {'Lead':<6} | {'PCR ACC':<10} | {'EC ACC':<10} | {'PCR RMSE':<10} | {'EC RMSE':<10} | {'P-RMSE Decr (Overall)':<22} | {'P-RMSE (Grid)':<12}")
-    print("-" * 97)
+    
+    print("\n============================ Multi-Lead Test Performance & AMS Summary ============================")
+    print(f"  {'Lead':<6} | {'Selected Model':<18} | {'CV ACC':<8} | {'Test ACC':<10} | {'EC ACC':<10} | {'Model RMSE':<10} | {'EC RMSE':<10} | {'P-RMSE Decr':<12}")
+    print("-" * 105)
     for lead in sorted(lead_avg_accs.keys()):
-        print(f"  Lead-{lead:<1} | {lead_avg_accs[lead]:.6f} | {lead_avg_ec_accs[lead]:.6f} | {lead_avg_pcr_rmse[lead]:.6f} | {lead_avg_ec_rmse[lead]:.6f} | {lead_avg_prmse_overall[lead]:.2f}% | {lead_avg_prmse_grid[lead]:.2f}%")
+        print(f"  Lead-{lead:<1} | {selected_model_by_lead[lead]:<18} | {best_cv_score_by_lead[lead]:.5f}  | {lead_avg_accs[lead]:.6f} | {lead_avg_ec_accs[lead]:.6f} | {lead_avg_pcr_rmse[lead]:.6f} | {lead_avg_ec_rmse[lead]:.6f} | {lead_avg_prmse_overall[lead]:.2f}%")
     
 if __name__ == "__main__":
     main()
