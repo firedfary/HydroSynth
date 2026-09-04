@@ -13,19 +13,19 @@ _proj_root = os.path.dirname(os.path.dirname(_curr_file))
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
-import config
 from utils.observe_norm import DataNormalizer
 import utils.utils as utils
+from project_paths import MODEL_DATA_DIR, PREPARED_DATA_DIR, STATION_TABLE_FILE
 
 def main():
     print("Starting data preparation for Lead-1 (V4 - Leak-Free Anomaly Normalization)...")
     
     # 1. Paths
-    data_path = os.getenv("MODESV21_DATA_PATH")
+    data_path = MODEL_DATA_DIR / "MODESv21_ecmwf_seas51"
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data directory not found: {data_path}")
         
-    observe_csv = os.path.join(_proj_root, "utils", "observe_data24.csv")
+    observe_csv = STATION_TABLE_FILE
     if not os.path.exists(observe_csv):
         raise FileNotFoundError(f"Observe CSV not found: {observe_csv}")
     
@@ -163,7 +163,7 @@ def main():
     final_cond = np.concatenate([lr_norm, obs_prev_norm], axis=1) # [N, 11, 120, 140]
     
     # Save the aligned datasets
-    save_dir = config.modelconfig['base_data_path']
+    save_dir = PREPARED_DATA_DIR
     os.makedirs(save_dir, exist_ok=True)
     
     cond_save_path = os.path.join(save_dir, 'lr_data_v4_aligned.npy')

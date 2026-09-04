@@ -1,7 +1,49 @@
-datas/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-.vscode/
-ref
+*.py[cod]
+*$py.class
+
+# Environment & local settings
 .env
+.env.local
+.env.*.local
+.vscode/
+.idea/
 .DS_Store
-.agents
+.agents/
+
+# Binary data & dataset formats
+*.nc
+*.nc4
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.pkl
+*.pickle
+*.parquet
+*.feather
+
+# Dynamic caching and experiment results (across all subprojects)
+**/cache/
+**/cached_*/
+**/results/
+**/result/
+**/output/
+**/outputs/
+**/runs/
+**/checkpoints/
+**/weights/
+**/logs/
+*.log
+
+# Workspace & scratch directories
+datas/
+projects/
+tmp/
+ref/
+workspace/

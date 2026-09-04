@@ -41,6 +41,11 @@ def load_env(env_file=None, override: bool = False) -> dict:
     return loaded
 
 
+try:
+    from utils.paths import SubprojectPaths, load_env
+except ImportError:  # Package import from the repository parent.
+    from .utils.paths import SubprojectPaths, load_env
+
 load_env()
 
 lr_foldr = "lr_unet"
@@ -49,16 +54,14 @@ save_weight_foldr = "weight_t0"
 picture_foldr = "picture"
 log_foldr = "log_ind"
 
-local_data_path = "E:/workplace/U_Net_3D/"
-colab_data_path = "/Users/huawei/workplace/"
+_configured_subproject = os.getenv("HYDRO_SUBPROJECT", "U_Net_3D")
+_project_paths = SubprojectPaths(__file__, subproject_name=_configured_subproject)
+_prepared_data_path = _project_paths.cache_dir / "prepared"
+_default_exp_path = _project_paths.get_exp_dir("default")
 
 
 def _resolve_base_path() -> str:
-    if os.name == "nt":
-        return local_data_path
-    if os.name == "posix":
-        return colab_data_path
-    raise ValueError(f"Unknown OS: {os.name}")
+    return str(_prepared_data_path)
 
 
 def _ensure_dir(path: str) -> None:
@@ -81,9 +84,9 @@ base_data_path = _resolve_base_path()
 lr_path = os.path.join(base_data_path, lr_foldr)
 hr_path = os.path.join(base_data_path, hr_foldr)
 sst_file = os.path.join(base_data_path, "sst_6chan.npy")
-save_weight_path = os.path.join(base_data_path, save_weight_foldr)
-picture_save_path = os.path.join(base_data_path, picture_foldr)
-log_path = os.path.join(base_data_path, log_foldr)
+save_weight_path = str(_default_exp_path / "checkpoints")
+picture_save_path = str(_default_exp_path / "figures")
+log_path = str(_default_exp_path / "logs")
 
 for _path in (save_weight_path, picture_save_path, log_path):
     _ensure_dir(_path)

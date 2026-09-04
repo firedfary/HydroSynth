@@ -16,7 +16,7 @@ if _proj_parent not in sys.path:
     sys.path.insert(0, _proj_parent)
 
 from HydroSynth.utils import utils
-from HydroSynth import config
+from project_paths import PREPARED_DATA_DIR, STATION_TABLE_FILE, experiment_dir
 
 def cal_acc_np(pred, target, mask):
     N, H, W = pred.shape
@@ -73,10 +73,10 @@ def compute_mca_np(X, Y, mask_x, mask_y, n_components=3, fit_train_only=True, tr
 
 def main():
     print("================ Training Best MCA-PCR Model for Lead-1 Prediction ================")
-    data_dir = config.modelconfig['base_data_path']
+    data_dir = PREPARED_DATA_DIR
     cond_file = os.path.join(data_dir, 'lr_data_v4_aligned.npy')
     target_file = os.path.join(data_dir, 'hr_data_v4_aligned.npy')
-    observe_csv = os.path.join(_proj_root, "utils", "observe_data24.csv")
+    observe_csv = STATION_TABLE_FILE
     
     print(f"Loading datasets from {data_dir}...")
     cond = np.load(cond_file)      # [N, 11, 120, 140]
@@ -137,7 +137,7 @@ def main():
     months_cos = np.cos(2 * np.pi * target_months / 12.0)
     
     # Load SST
-    sst_path = config.modelconfig["sst_file"]
+    sst_path = PREPARED_DATA_DIR / "sst_6chan.npy"
     sst = np.load(sst_path)
     if sst.ndim == 4:
         sst = np.mean(sst, axis=1) # [372, 180, 360]
@@ -204,7 +204,7 @@ def main():
     pred_test_smoothed[:, ~mask] = 0.0
     
     # Save predictions
-    save_path = os.path.join(data_dir, "pred_pcr_lead1.npy")
+    save_path = experiment_dir("pcr_best") / "pred_pcr_lead1.npy"
     np.save(save_path, pred_test_smoothed)
     print(f"Predictions saved successfully to: {save_path}")
     
