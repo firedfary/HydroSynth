@@ -40,13 +40,13 @@ def main():
     parser.add_argument(
         "--pipeline-dir",
         type=Path,
-        default=paths.get_exp_dir("current_recommended_pipeline"),
-        help="Root directory of the pipeline experiment results.",
+        default=paths.get_exp_dir("final_model"),
+        help="Root directory of the model results (default: final_model).",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=paths.get_exp_dir("paper_evaluation"),
+        default=paths.get_exp_dir("final_model") / "evaluation",
         help="Output directory for generated paper figures and LaTeX tables.",
     )
     parser.add_argument(
@@ -54,6 +54,12 @@ def main():
         type=int,
         default=21,
         help="Number of test months for independent evaluation window (default: 21).",
+    )
+    parser.add_argument(
+        "--target-lead",
+        type=int,
+        default=1,
+        help="Target lead time index for spatial and categorical case figures (default: 1).",
     )
     parser.add_argument(
         "--observation-transform",
@@ -86,6 +92,7 @@ def main():
     print("HydroSynth U_Net_3D Universal Precipitation Evaluation & Visualizer")
     print(f"Pipeline Directory: {args.pipeline_dir}")
     print(f"Output Directory:   {args.output_dir}")
+    print(f"Target Lead:        Lead {args.target_lead}")
     print("=" * 70)
 
     # 1. Load Observations
@@ -110,21 +117,38 @@ def main():
     date_to_idx = {d: i for i, d in enumerate(obs_dates)}
 
     # 2. Check and Load Model Predictions
-    final_file = args.pipeline_dir / "final" / "multi_lead_predict_results_ensemble_safe.npy"
-    base_ec_file = args.pipeline_dir / "model_as_sample_transfer" / "multi_lead_ec_precip_anom_results.npy"
-    if not base_ec_file.exists():
-        base_ec_file = args.pipeline_dir / "base_ams" / "multi_lead_ec_precip_anom_results.npy"
-
-    dates_file = args.pipeline_dir / "model_as_sample_transfer" / "multi_lead_dates.npy"
-    if not dates_file.exists():
-        dates_file = args.pipeline_dir / "base_ams" / "multi_lead_dates.npy"
+    final_v2_file = args.pipeline_dir / "multi_lead_predict_results_final.npy"
+    final_safe_file = args.pipeline_dir / "final" / "multi_lead_predict_results_ensemble_safe.npy"
 
     models_available = {}
-    if final_file.exists() and base_ec_file.exists() and dates_file.exists():
-        print("Found completed pipeline artifacts. Loading production models...")
+    if final_v2_file.exists():
+        print(f"Found final model artifacts in {args.pipeline_dir}. Loading production model...")
+        dates_file = args.pipeline_dir / "multi_lead_dates.npy"
+        base_ec_file = args.pipeline_dir / "multi_lead_ec_precip_anom_results.npy"
+        obs_file = args.pipeline_dir / "multi_lead_obs_results.npy"
+
+        test_dates = np.load(dates_file).astype(str)
+        test_obs_multilead = np.asarray(np.load(obs_file), dtype=np.float64)
+        test_ec = np.asarray(np.load(base_ec_file), dtype=np.float64)
+        test_final = np.asarray(np.load(final_v2_file), dtype=np.float64)
+
+        baseline_name = "ECMWF SEAS5"
+        baseline_data = test_ec
+        models_available["ReMAP (Ours)"] = test_final
+
+    elif final_safe_file.exists():
+        print(f"Found pipeline safe ensemble in {args.pipeline_dir}. Loading...")
+        base_ec_file = args.pipeline_dir / "model_as_sample_transfer" / "multi_lead_ec_precip_anom_results.npy"
+        if not base_ec_file.exists():
+            base_ec_file = args.pipeline_dir / "base_ams" / "multi_lead_ec_precip_anom_results.npy"
+
+        dates_file = args.pipeline_dir / "model_as_sample_transfer" / "multi_lead_dates.npy"
+        if not dates_file.exists():
+            dates_file = args.pipeline_dir / "base_ams" / "multi_lead_dates.npy"
+
         prod_dates = np.load(dates_file).astype(str)
         ec_all = np.load(base_ec_file, mmap_mode="r")
-        final_all = np.load(final_file, mmap_mode="r")
+        final_all = np.load(final_safe_file, mmap_mode="r")
 
         # Determine valid test indices
         valid_date_idx = np.flatnonzero(np.isfinite(ec_all[:, 0, 0, 0]))

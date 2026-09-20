@@ -839,8 +839,8 @@ def main():
     print("=" * 85)
 
     full_manifest = {
-        "model_name": "HydroSynth_U_Net_3D_Final_Model",
-        "description": "Recency-Decayed Multi-Model Transfer + Seasonal Stacking Pure Ensemble (No Fallback Gate)",
+        "model_name": "ReMAP",
+        "description": "Recency-Decayed Model-As-Sample Precipitation (ReMAP) Ensemble (No Fallback Gate)",
         "test_period": ["2023-01-01", "2024-09-01"],
         "macro_metrics": {
             "model_acc": macro_model_acc,
