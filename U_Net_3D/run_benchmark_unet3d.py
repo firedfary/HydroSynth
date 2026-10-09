@@ -58,8 +58,8 @@ def main():
     parser.add_argument(
         "--target-lead",
         type=int,
-        default=1,
-        help="Target lead time index for spatial and categorical case figures (default: 1).",
+        default=0,
+        help="Target lead time index for spatial and categorical case figures (default: 0).",
     )
     parser.add_argument(
         "--observation-transform",
@@ -223,7 +223,7 @@ def main():
 
     # 5. Generate All Publication Figures
     print("\nGenerating 8 publication-quality academic figures...")
-    figs = bench.generate_all_figures(figs_dir, dpi=args.dpi)
+    figs = bench.generate_all_figures(figs_dir, dpi=args.dpi, target_lead=args.target_lead)
     for k, p in figs.items():
         print(f"  [{k}] -> {p}")
 

@@ -71,9 +71,10 @@ def plot_spatial_comparison(
     vmaxs: Optional[Union[float, Sequence[Optional[float]]]] = None,
     color_modes: Union[str, Sequence[str]] = "diverging",
     save_path: Optional[Union[str, Path]] = None,
-    figsize_per_panel: Tuple[float, float] = (5.5, 4.5),
+    figsize_per_panel: Tuple[float, float] = (4.9, 3.2),
     dpi: int = 300,
     show: bool = False,
+    shared_colorbar: str = "col",
 ) -> plt.Figure:
     """Multi-panel spatial field comparison with China borders and South China Sea inset.
 
@@ -87,6 +88,10 @@ def plot_spatial_comparison(
     vmins, vmaxs : float or list of floats
     color_modes : 'diverging' (blue-red) or 'sequential'
     save_path : path to save figure
+    figsize_per_panel : tuple of (width, height) per panel
+    shared_colorbar : 'col' (one horizontal colorbar per column at bottom),
+                      'row' (one vertical colorbar per row on right),
+                      'global', or 'individual'
     """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -96,25 +101,20 @@ def plot_spatial_comparison(
     nrows = int(np.ceil(n_fields / ncols))
     proj = ccrs.PlateCarree(central_longitude=0.0)
 
-    fig, axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(ncols * figsize_per_panel[0], nrows * figsize_per_panel[1]),
-        subplot_kw={"projection": proj},
-        facecolor="white",
-        squeeze=False,
-    )
-
     borders = _load_borders()
 
     # Normalize limits and color modes
     if vmins is None or isinstance(vmins, (int, float)):
         vmins_list = [vmins] * n_fields
+    elif len(vmins) == ncols and n_fields > ncols:
+        vmins_list = list(vmins) * nrows
     else:
         vmins_list = list(vmins)
 
     if vmaxs is None or isinstance(vmaxs, (int, float)):
         vmaxs_list = [vmaxs] * n_fields
+    elif len(vmaxs) == ncols and n_fields > ncols:
+        vmaxs_list = list(vmaxs) * nrows
     else:
         vmaxs_list = list(vmaxs)
 
@@ -123,102 +123,450 @@ def plot_spatial_comparison(
     else:
         cmodes_list = list(color_modes)
 
-    # Standard diverging colormap for precipitation anomalies (Red=dry, Blue=wet)
+    # Standard diverging colormap for precipitation anomalies (Red=dry/drought, Blue=wet/surplus)
+    # ColorBrewer RdBu 11-class diverging palette with pure neutral white center for normal anomaly
     base_colors = [
-        "#8c510a",
-        "#bf812d",
-        "#dfc27d",
-        "#f6e8c3",
-        "#f5f5f5",
-        "#c7eae5",
-        "#80cdc1",
-        "#35978f",
-        "#01665e",
+        "#67001f",
+        "#b2182b",
+        "#d6604d",
+        "#f4a582",
+        "#fddbc7",
+        "#ffffff",
+        "#d1e5f0",
+        "#92c5de",
+        "#4393c3",
+        "#2166ac",
+        "#053061",
     ]
-    cmap_diverging = mcolors.LinearSegmentedColormap.from_list("precip_anom", base_colors, N=11)
+    cmap_diverging = mcolors.ListedColormap(base_colors)
     if hasattr(cmap_diverging, "with_extremes"):
-        cmap_diverging = cmap_diverging.with_extremes(over="#003c30", under="#543005")
+        cmap_diverging = cmap_diverging.with_extremes(over="#021d3a", under="#490014")
     else:
-        cmap_diverging.set_over("#003c30")
-        cmap_diverging.set_under("#543005")
+        cmap_diverging.set_over("#021d3a")
+        cmap_diverging.set_under("#490014")
 
-    for idx in range(nrows * ncols):
-        r = idx // ncols
-        c = idx % ncols
-        ax = axes[r, c]
+    use_col_colorbar = (shared_colorbar in ("col", "column") and ncols >= 2)
+    use_row_colorbar = (shared_colorbar == "row" and nrows > 1 and ncols >= 3)
 
-        if idx >= n_fields:
-            ax.axis("off")
-            continue
+    if use_col_colorbar:
+        import re
 
-        arr = fields[idx]
-        title = titles[idx] if idx < len(titles) else f"Field {idx+1}"
-        vmin = vmins_list[idx] if vmins_list[idx] is not None else float(np.nanmin(arr))
-        vmax = vmaxs_list[idx] if vmaxs_list[idx] is not None else float(np.nanmax(arr))
-        cm_mode = cmodes_list[idx]
+        total_w = ncols * figsize_per_panel[0]
+        extra_h = 0.8 if nrows > 1 else 0.7
+        total_h = nrows * figsize_per_panel[1] + extra_h
+        fig = plt.figure(figsize=(total_w, total_h), facecolor="white")
 
-        ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
-        for line in borders:
-            ax.plot(line[0::2], line[1::2], "-", lw=0.45, color="black", transform=ccrs.Geodetic())
+        top_map = 0.96
+        bottom_map = 0.12 if nrows > 1 else 0.20
+        top_cbar = 0.062 if nrows > 1 else 0.10
+        bottom_cbar = 0.040 if nrows > 1 else 0.05
 
-        ax.set_extent([70, 140, 15, 55], crs=proj)
-        ax.set_xticks(range(70, 141, 20), crs=proj)
-        ax.set_yticks(range(20, 56, 10), crs=proj)
-        ax.xaxis.set_major_formatter(LongitudeFormatter(zero_direction_label=False))
-        ax.yaxis.set_major_formatter(LatitudeFormatter())
-        ax.tick_params(labelsize=9)
-
-        if cm_mode == "diverging":
-            abs_max = max(abs(vmin), abs(vmax))
-            norm = MidpointNormalize(vmin=-abs_max, vmax=abs_max, midpoint=0.0)
-            levels = np.linspace(-abs_max, abs_max, 11)
-            cf = ax.contourf(
-                longitudes,
-                latitudes,
-                arr,
-                levels=levels,
-                cmap=cmap_diverging,
-                norm=norm,
-                extend="both",
-                transform=proj,
-            )
-        else:
-            cf = ax.contourf(
-                longitudes,
-                latitudes,
-                arr,
-                levels=np.linspace(vmin, vmax, 10),
-                cmap="viridis",
-                extend="both",
-                transform=proj,
-            )
-
-        if maskout and CHINA_SHP.exists():
-            try:
-                maskout.shp2clip(cf, ax, str(CHINA_SHP))
-            except Exception:
-                pass
-
-        ax.set_title(title, fontsize=PLOT_CONFIG["font_size_title"], pad=6, loc="left")
-
-        # Colorbar
-        cbar = fig.colorbar(cf, ax=ax, orientation="horizontal", fraction=0.046, pad=0.08)
-        cbar.ax.tick_params(labelsize=8)
-        cbar.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
-
-        # Inset for South China Sea Islands
-        fig.canvas.draw()
-        pos = ax.get_position()
-        sub_ax = fig.add_axes(
-            [pos.x0 + 0.81 * pos.width, pos.y0 + 0.10 * pos.height, 0.17 * pos.width, 0.22 * pos.height],
-            projection=proj,
+        gs_maps = fig.add_gridspec(
+            nrows,
+            ncols,
+            top=top_map,
+            bottom=bottom_map,
+            left=0.04,
+            right=0.97,
+            wspace=0.07,
+            hspace=0.18,
         )
-        sub_ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
-        for line in borders:
-            sub_ax.plot(line[0::2], line[1::2], "-", lw=0.4, color="black", transform=ccrs.Geodetic())
-        sub_ax.set_extent([105, 125, 3, 25], crs=proj)
 
-    plt.subplots_adjust(wspace=0.18, hspace=0.25)
+        gs_cbars = fig.add_gridspec(
+            1,
+            ncols,
+            top=top_cbar,
+            bottom=bottom_cbar,
+            left=0.06,
+            right=0.95,
+            wspace=0.18,
+        )
+
+        # Compute column-level independent color scale and extract column titles
+        col_vmaxs = {}
+        col_levels = {}
+        col_ticks = {}
+        col_names = {}
+
+        # Identify active valid mask (e.g. China stations mask) from zero-padded fields if present
+        zero_padded_masks = [
+            np.isfinite(f) & (np.abs(f) > 1e-7)
+            for f in fields
+            if np.mean(np.isfinite(f) & (np.abs(f) > 1e-7)) < 0.85
+        ]
+        active_mask = np.any(zero_padded_masks, axis=0) if zero_padded_masks else None
+
+        def _extract_valid_abs(idx_list: list[int]) -> np.ndarray:
+            arrs = []
+            for i in idx_list:
+                f = fields[i]
+                if active_mask is not None and f.shape == active_mask.shape:
+                    v = f[active_mask & np.isfinite(f)]
+                else:
+                    v = f[np.isfinite(f)]
+                if len(v) > 0:
+                    arrs.append(np.abs(v))
+            return np.concatenate(arrs) if arrs else np.array([1.0])
+
+        def _snap_to_tier(val: float, tiers: tuple[float, ...], tol: float = 1.05) -> float:
+            for t in tiers:
+                if val <= t * tol:
+                    return float(t)
+            return float(tiers[-1])
+
+        # Precompute coupled model tier when ncols >= 3 and model columns have vmax=None
+        shared_model_vmax = None
+        if ncols >= 3:
+            model_col_indices = [
+                r * ncols + c
+                for c in range(1, ncols)
+                for r in range(nrows)
+                if (r * ncols + c) < n_fields
+            ]
+            if model_col_indices and not any(
+                i < len(vmaxs_list) and vmaxs_list[i] is not None for i in model_col_indices
+            ):
+                # Compute 98th percentile per model column and take their max for fair side-by-side comparison
+                col_p98s = []
+                for c_mod in range(1, ncols):
+                    c_idxs = [r * ncols + c_mod for r in range(nrows) if (r * ncols + c_mod) < n_fields]
+                    if c_idxs:
+                        c_abs = _extract_valid_abs(c_idxs)
+                        col_p98s.append(float(np.percentile(c_abs, 98.0)))
+                ref_model_amp = max(col_p98s) if col_p98s else 0.5
+                shared_model_vmax = _snap_to_tier(ref_model_amp, (0.3, 0.5, 0.8, 1.0))
+
+        for c in range(ncols):
+            col_indices = [r * ncols + c for r in range(nrows) if (r * ncols + c) < n_fields]
+            if not col_indices:
+                continue
+
+            if any(i < len(vmaxs_list) and vmaxs_list[i] is not None for i in col_indices):
+                raw_v = max(
+                    float(vmaxs_list[i]) for i in col_indices if i < len(vmaxs_list) and vmaxs_list[i] is not None
+                )
+                col_vmax = _snap_to_tier(raw_v, (0.3, 0.5, 0.8, 1.0, 1.5), tol=1.02)
+            elif c >= 1 and shared_model_vmax is not None:
+                col_vmax = shared_model_vmax
+            else:
+                col_abs = _extract_valid_abs(col_indices)
+                p98 = float(np.percentile(col_abs, 98.0))
+                if c == 0 and ncols >= 3:
+                    col_vmax = _snap_to_tier(p98, (1.0, 1.5))
+                else:
+                    col_vmax = _snap_to_tier(p98, (0.3, 0.5, 0.8, 1.0, 1.5))
+
+            col_vmaxs[c] = col_vmax
+
+            # Design 11 symmetric bins (12 levels) centered at 0.0 with pure white middle bin [-0.1*V, +0.1*V]
+            col_levels[c] = np.linspace(-1.1 * col_vmax, 1.1 * col_vmax, 12)
+            col_ticks[c] = [-col_vmax, -0.5 * col_vmax, 0.0, 0.5 * col_vmax, col_vmax]
+
+            # Clean name for colorbar label
+            first_title = titles[col_indices[0]] if col_indices[0] < len(titles) else f"Column {c+1}"
+            s = re.sub(r"^\s*\([a-zA-Z0-9]+\)\s*", "", first_title)
+            s = re.sub(r"\s*\([^)]*\)\s*$", "", s)
+            s = re.sub(r"\s+Lead\s*\d+\b", "", s).strip()
+            col_names[c] = s if s else f"Col {c+1}"
+
+        col_last_cf = {}
+
+        for r in range(nrows):
+            for c in range(ncols):
+                idx = r * ncols + c
+                if idx >= n_fields:
+                    ax = fig.add_subplot(gs_maps[r, c])
+                    ax.axis("off")
+                    continue
+
+                arr = fields[idx]
+                title = titles[idx] if idx < len(titles) else f"Field {idx+1}"
+                levels = col_levels[c]
+
+                ax = fig.add_subplot(gs_maps[r, c], projection=proj)
+                ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
+                for line in borders:
+                    ax.plot(line[0::2], line[1::2], "-", lw=0.45, color="black", transform=ccrs.Geodetic())
+
+                ax.set_extent([70, 140, 15, 55], crs=proj)
+
+                # Show coordinates ticks only on outer boundary
+                if c == 0:
+                    ax.set_yticks(range(20, 56, 10), crs=proj)
+                    ax.yaxis.set_major_formatter(LatitudeFormatter())
+                    ax.tick_params(axis="y", labelsize=8.5)
+                else:
+                    ax.set_yticks([], crs=proj)
+
+                is_bottom_of_col = (r == nrows - 1) or ((r + 1) * ncols + c >= n_fields)
+                if is_bottom_of_col:
+                    ax.set_xticks(range(70, 141, 20), crs=proj)
+                    ax.xaxis.set_major_formatter(LongitudeFormatter(zero_direction_label=False))
+                    ax.tick_params(axis="x", labelsize=8.5)
+                else:
+                    ax.set_xticks([], crs=proj)
+
+                cf = ax.contourf(
+                    longitudes,
+                    latitudes,
+                    arr,
+                    levels=levels,
+                    cmap=cmap_diverging,
+                    extend="both",
+                    transform=proj,
+                )
+                col_last_cf[c] = cf
+
+                if maskout and CHINA_SHP.exists():
+                    try:
+                        maskout.shp2clip(cf, ax, str(CHINA_SHP))
+                    except Exception:
+                        pass
+
+                ax.set_title(title, fontsize=10.5, pad=5, loc="left")
+
+                # Inset for South China Sea Islands
+                pos = ax.get_position()
+                sub_ax = fig.add_axes(
+                    [pos.x0 + 0.77 * pos.width, pos.y0 + 0.03 * pos.height, 0.20 * pos.width, 0.24 * pos.height],
+                    projection=proj,
+                )
+                sub_ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
+                for line in borders:
+                    sub_ax.plot(line[0::2], line[1::2], "-", lw=0.35, color="black", transform=ccrs.Geodetic())
+                sub_ax.set_extent([105, 125, 3, 25], crs=proj)
+                sub_ax.patch.set_edgecolor("black")
+                sub_ax.patch.set_linewidth(0.6)
+
+        # Bottom horizontal colorbars, one per column
+        for c in range(ncols):
+            if c in col_last_cf:
+                cax = fig.add_subplot(gs_cbars[0, c])
+                cbar = fig.colorbar(col_last_cf[c], cax=cax, orientation="horizontal")
+                cbar_label = f"{col_names[c]} [signed_log1p]"
+                cbar.set_label(cbar_label, fontsize=8.5, labelpad=3)
+                cbar.ax.tick_params(labelsize=8)
+                if c in col_ticks:
+                    cbar.set_ticks(col_ticks[c])
+                    cbar.set_ticklabels(
+                        [
+                            "0.0"
+                            if abs(t_val) < 1e-9
+                            else (f"{t_val:.1f}" if abs(t_val * 10 - round(t_val * 10)) < 1e-6 else f"{t_val:.2f}")
+                            for t_val in col_ticks[c]
+                        ]
+                    )
+                else:
+                    cbar.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+
+    elif use_row_colorbar:
+        total_w = ncols * figsize_per_panel[0] + 0.5
+        total_h = nrows * figsize_per_panel[1]
+        fig = plt.figure(figsize=(total_w, total_h), facecolor="white")
+        gs = fig.add_gridspec(
+            nrows,
+            ncols + 1,
+            width_ratios=[1] * ncols + [0.035],
+            wspace=0.06,
+            hspace=0.20,
+            left=0.04,
+            right=0.96,
+            top=0.95,
+            bottom=0.05,
+        )
+
+        for r in range(nrows):
+            row_indices = [r * ncols + c for c in range(ncols) if (r * ncols + c) < n_fields]
+            if not row_indices:
+                continue
+
+            # Compute row-level unified color scale
+            if any(vmaxs_list[i] is not None for i in row_indices):
+                row_vmax = max(
+                    float(vmaxs_list[i]) if vmaxs_list[i] is not None else 1.0
+                    for i in row_indices
+                )
+            else:
+                row_vmax = max(
+                    max(abs(float(np.nanmin(fields[i]))), abs(float(np.nanmax(fields[i]))))
+                    for i in row_indices
+                )
+                if row_vmax > 1.5:
+                    row_vmax = 2.0
+                elif row_vmax > 0.8:
+                    row_vmax = 1.2
+                else:
+                    row_vmax = round(row_vmax, 1)
+
+            # 11 bins (12 levels) centered at 0.0 with pure white middle bin
+            levels = np.linspace(-row_vmax, row_vmax, 12)
+
+            last_cf = None
+            date_str = ""
+
+            for c in range(ncols):
+                idx = r * ncols + c
+                if idx >= n_fields:
+                    ax = fig.add_subplot(gs[r, c])
+                    ax.axis("off")
+                    continue
+
+                arr = fields[idx]
+                title = titles[idx] if idx < len(titles) else f"Field {idx+1}"
+                if "(" in title and ")" in title:
+                    # extract date if present in title, e.g. (2023-01)
+                    sub_str = title[title.rfind("(") + 1 : title.rfind(")")]
+                    if any(char.isdigit() for char in sub_str):
+                        date_str = sub_str
+
+                ax = fig.add_subplot(gs[r, c], projection=proj)
+                ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
+                for line in borders:
+                    ax.plot(line[0::2], line[1::2], "-", lw=0.45, color="black", transform=ccrs.Geodetic())
+
+                ax.set_extent([70, 140, 15, 55], crs=proj)
+
+                # Show coordinates ticks only on outer boundary
+                if c == 0:
+                    ax.set_yticks(range(20, 56, 10), crs=proj)
+                    ax.yaxis.set_major_formatter(LatitudeFormatter())
+                    ax.tick_params(axis="y", labelsize=8.5)
+                else:
+                    ax.set_yticks([], crs=proj)
+
+                if r == nrows - 1:
+                    ax.set_xticks(range(70, 141, 20), crs=proj)
+                    ax.xaxis.set_major_formatter(LongitudeFormatter(zero_direction_label=False))
+                    ax.tick_params(axis="x", labelsize=8.5)
+                else:
+                    ax.set_xticks([], crs=proj)
+
+                cf = ax.contourf(
+                    longitudes,
+                    latitudes,
+                    arr,
+                    levels=levels,
+                    cmap=cmap_diverging,
+                    extend="both",
+                    transform=proj,
+                )
+                last_cf = cf
+
+                if maskout and CHINA_SHP.exists():
+                    try:
+                        maskout.shp2clip(cf, ax, str(CHINA_SHP))
+                    except Exception:
+                        pass
+
+                ax.set_title(title, fontsize=10.5, pad=5, loc="left")
+
+                # Inset for South China Sea Islands
+                pos = ax.get_position()
+                sub_ax = fig.add_axes(
+                    [pos.x0 + 0.77 * pos.width, pos.y0 + 0.03 * pos.height, 0.20 * pos.width, 0.24 * pos.height],
+                    projection=proj,
+                )
+                sub_ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
+                for line in borders:
+                    sub_ax.plot(line[0::2], line[1::2], "-", lw=0.35, color="black", transform=ccrs.Geodetic())
+                sub_ax.set_extent([105, 125, 3, 25], crs=proj)
+                sub_ax.patch.set_edgecolor("black")
+                sub_ax.patch.set_linewidth(0.6)
+
+            # Row colorbar in dedicated column
+            cax = fig.add_subplot(gs[r, ncols])
+            cbar = fig.colorbar(last_cf, cax=cax, orientation="vertical")
+            cbar_label = f"signed_log1p\n[{date_str}]" if date_str else "signed_log1p"
+            cbar.set_label(cbar_label, fontsize=8.5, labelpad=2)
+            cbar.ax.tick_params(labelsize=7.5)
+            cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+
+    else:
+        # Standard per-panel horizontal colorbar layout
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(ncols * figsize_per_panel[0], nrows * figsize_per_panel[1]),
+            subplot_kw={"projection": proj},
+            facecolor="white",
+            squeeze=False,
+        )
+
+        for idx in range(nrows * ncols):
+            r = idx // ncols
+            c = idx % ncols
+            ax = axes[r, c]
+
+            if idx >= n_fields:
+                ax.axis("off")
+                continue
+
+            arr = fields[idx]
+            title = titles[idx] if idx < len(titles) else f"Field {idx+1}"
+            vmin = vmins_list[idx] if vmins_list[idx] is not None else float(np.nanmin(arr))
+            vmax = vmaxs_list[idx] if vmaxs_list[idx] is not None else float(np.nanmax(arr))
+            cm_mode = cmodes_list[idx]
+
+            ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
+            for line in borders:
+                ax.plot(line[0::2], line[1::2], "-", lw=0.45, color="black", transform=ccrs.Geodetic())
+
+            ax.set_extent([70, 140, 15, 55], crs=proj)
+            ax.set_xticks(range(70, 141, 20), crs=proj)
+            ax.set_yticks(range(20, 56, 10), crs=proj)
+            ax.xaxis.set_major_formatter(LongitudeFormatter(zero_direction_label=False))
+            ax.yaxis.set_major_formatter(LatitudeFormatter())
+            ax.tick_params(labelsize=9)
+
+            if cm_mode == "diverging":
+                abs_max = max(abs(vmin), abs(vmax))
+                # 11 bins (12 levels) centered at 0.0 with pure white middle bin
+                levels = np.linspace(-abs_max, abs_max, 12)
+                cf = ax.contourf(
+                    longitudes,
+                    latitudes,
+                    arr,
+                    levels=levels,
+                    cmap=cmap_diverging,
+                    extend="both",
+                    transform=proj,
+                )
+            else:
+                cf = ax.contourf(
+                    longitudes,
+                    latitudes,
+                    arr,
+                    levels=np.linspace(vmin, vmax, 10),
+                    cmap="viridis",
+                    extend="both",
+                    transform=proj,
+                )
+
+            if maskout and CHINA_SHP.exists():
+                try:
+                    maskout.shp2clip(cf, ax, str(CHINA_SHP))
+                except Exception:
+                    pass
+
+            ax.set_title(title, fontsize=PLOT_CONFIG["font_size_title"], pad=6, loc="left")
+
+            # Colorbar
+            cbar = fig.colorbar(cf, ax=ax, orientation="horizontal", fraction=0.046, pad=0.08)
+            cbar.ax.tick_params(labelsize=8)
+            cbar.ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
+
+            # Inset for South China Sea Islands
+            pos = ax.get_position()
+            sub_ax = fig.add_axes(
+                [pos.x0 + 0.77 * pos.width, pos.y0 + 0.10 * pos.height, 0.18 * pos.width, 0.22 * pos.height],
+                projection=proj,
+            )
+            sub_ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor="#F8F8F8")
+            for line in borders:
+                sub_ax.plot(line[0::2], line[1::2], "-", lw=0.4, color="black", transform=ccrs.Geodetic())
+            sub_ax.set_extent([105, 125, 3, 25], crs=proj)
+
+        plt.subplots_adjust(wspace=0.18, hspace=0.25)
 
     if save_path:
         p = Path(save_path)
@@ -536,7 +884,7 @@ def plot_categorical_skill_bars(
     show: bool = False,
 ) -> plt.Figure:
     """Grouped bar chart comparing models across event anomaly thresholds."""
-    fig, ax = plt.subplots(figsize=(8.5, 4.8), facecolor="white")
+    fig, ax = plt.subplots(figsize=(9.2, 4.8), facecolor="white")
 
     n_thresholds = len(threshold_labels)
     n_models = len(model_scores)
@@ -544,16 +892,19 @@ def plot_categorical_skill_bars(
     width = 0.8 / max(n_models, 1)
 
     colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd"]
+    all_scores = [float(s) for scs in model_scores.values() for s in scs]
+    max_h = max(all_scores) if all_scores else 0.2
+    min_h = min(all_scores) if all_scores else 0.0
 
     for i, (m_name, scores) in enumerate(model_scores.items()):
         offset = (i - n_models / 2 + 0.5) * width
         c = colors[i % len(colors)]
         rects = ax.bar(x + offset, scores, width, label=m_name, color=c, alpha=0.88, edgecolor="none")
 
-        # Value annotation
+        # Value annotation: annotate all visible bars with height >= 0.005
         for rect in rects:
             h = rect.get_height()
-            if abs(h) > 0.02:
+            if abs(h) >= 0.005:
                 va = "bottom" if h >= 0 else "top"
                 ax.annotate(
                     f"{h:.2f}",
@@ -562,17 +913,25 @@ def plot_categorical_skill_bars(
                     textcoords="offset points",
                     ha="center",
                     va=va,
-                    fontsize=7.5,
+                    fontsize=8.0,
                 )
 
+    formatted_labels = [
+        lbl.replace(" (", "\n(") if " (" in str(lbl) else str(lbl)
+        for lbl in threshold_labels
+    ]
     ax.set_xticks(x)
-    ax.set_xticklabels(threshold_labels, fontsize=PLOT_CONFIG["font_size_tick"])
+    ax.set_xticklabels(formatted_labels, fontsize=9.5)
     ax.set_ylabel(metric_name, fontsize=PLOT_CONFIG["font_size_label"])
-    ax.set_title(title, fontsize=PLOT_CONFIG["font_size_title"], loc="left", pad=8)
+    ax.set_title(title, fontsize=PLOT_CONFIG["font_size_title"], loc="left", pad=10)
     ax.axhline(0, color="black", linewidth=0.8, linestyle="-")
 
+    top_limit = max_h * 1.15 if max_h > 0 else 0.2
+    bottom_limit = min_h * 1.15 if min_h < 0 else 0.0
+    ax.set_ylim(bottom_limit, top_limit)
+
     ax.grid(True, axis="y", linestyle="--", color="#E5E5E5", alpha=0.7)
-    ax.legend(frameon=True, fontsize=PLOT_CONFIG["font_size_legend"])
+    ax.legend(frameon=True, fontsize=PLOT_CONFIG["font_size_legend"], loc="upper right")
 
     if save_path:
         p = Path(save_path)

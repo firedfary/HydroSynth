@@ -260,6 +260,7 @@ class PrecipitationBenchmark:
         self,
         output_dir: Optional[Union[str, Path]] = None,
         dpi: int = 300,
+        target_lead: int = 0,
     ) -> Dict[str, Path]:
         """Generate full suite of publication-ready academic figures and save to output_dir."""
         out_dir = Path(output_dir) if output_dir is not None else self.output_dir
@@ -305,7 +306,7 @@ class PrecipitationBenchmark:
 
         # 2. Taylor diagram (Lead 0 and Lead 1)
         taylor_stats = {}
-        target_lead = 0
+        target_lead = int(target_lead)
         obs_flat, w = self._get_eval_arrays(self.obs, lead=target_lead)
         obs_std = spatial_spread(obs_flat, w)
 
@@ -355,29 +356,49 @@ class PrecipitationBenchmark:
         )
         generated_figures["fig3_categorical"] = fig3_path
 
-        # 4. Spatial comparison map (if 2D grid data is available)
+        # 4. Spatial comparison map (3x3: 3 representative months x [Obs, Baseline, Model])
         if self.obs.ndim == 4 and self.latitudes is not None and self.longitudes is not None:
-            # Pick a sample test time step (e.g. index 0)
-            t_idx = 0
-            date_str = str(self.dates[t_idx])[:7] if self.dates is not None else f"Month {t_idx+1}"
-            fields = [self.obs[t_idx, target_lead]]
-            titles = [f"(a) Observation ({date_str})"]
+            n_dates = len(self.dates) if self.dates is not None else self.obs.shape[0]
+            rep_months = ["2023-01", "2023-07", "2023-11"]
+            t_indices = []
+            if self.dates is not None:
+                str_dates = [str(d)[:7] for d in self.dates]
+                for m in rep_months:
+                    if m in str_dates:
+                        t_indices.append(str_dates.index(m))
+            if len(t_indices) < 3:
+                if n_dates >= 3:
+                    t_indices = [0, n_dates // 3, 2 * n_dates // 3]
+                else:
+                    t_indices = list(range(n_dates))
 
-            if self.baseline_name and self.baseline_data is not None:
-                fields.append(self.baseline_data[t_idx, target_lead])
-                titles.append(f"(b) {self.baseline_name} (Lead {target_lead})")
-
-            # Add primary candidate model
+            fields = []
+            titles = []
+            letters = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+            p_idx = 0
             primary_model_name = list(self.models.keys())[0] if self.models else None
-            if primary_model_name:
-                m_field = self.models[primary_model_name][t_idx, target_lead]
-                fields.append(m_field)
-                titles.append(f"(c) {primary_model_name} (Lead {target_lead})")
 
-                # Add residual error map
-                res_field = m_field - self.obs[t_idx, target_lead]
-                fields.append(res_field)
-                titles.append("(d) Residual Error (Model - Obs)")
+            for t_idx in t_indices:
+                date_str = str(self.dates[t_idx])[:7] if self.dates is not None else f"Month {t_idx+1}"
+                # Col 1: Observation
+                fields.append(self.obs[t_idx, target_lead])
+                titles.append(f"({letters[p_idx % len(letters)]}) Observation ({date_str})")
+                p_idx += 1
+
+                # Col 2: Baseline (SEAS5)
+                if self.baseline_name and self.baseline_data is not None:
+                    fields.append(self.baseline_data[t_idx, target_lead])
+                    titles.append(f"({letters[p_idx % len(letters)]}) {self.baseline_name} ({date_str})")
+                    p_idx += 1
+
+                # Col 3: Primary Candidate Model (ReMAP)
+                if primary_model_name:
+                    m_field = self.models[primary_model_name][t_idx, target_lead]
+                    fields.append(m_field)
+                    titles.append(f"({letters[p_idx % len(letters)]}) {primary_model_name} ({date_str})")
+                    p_idx += 1
+
+            n_cols_case = 1 + (1 if (self.baseline_name and self.baseline_data is not None) else 0) + (1 if primary_model_name else 0)
 
             fig4_path = out_dir / "fig4_spatial_comparison_case.png"
             plot_spatial_comparison(
@@ -385,10 +406,12 @@ class PrecipitationBenchmark:
                 titles,
                 self.latitudes,
                 self.longitudes,
-                ncols=2 if len(fields) <= 4 else 3,
+                ncols=n_cols_case,
+                vmaxs=None,
                 color_modes=["diverging"] * len(fields),
                 save_path=fig4_path,
                 dpi=dpi,
+                shared_colorbar="col",
             )
             generated_figures["fig4_spatial_map"] = fig4_path
 
