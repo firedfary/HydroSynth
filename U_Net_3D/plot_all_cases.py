@@ -10,6 +10,7 @@ Synchronizes all figures to Desktop research repository.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import shutil
@@ -247,11 +248,35 @@ def render_highlight_case_figure(
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Multi-lead spatial comparison and comprehensive diagnostic pipeline."
+    )
+    parser.add_argument(
+        "--exp-name",
+        type=str,
+        default="final_model",
+        help="Experiment name under results/U_Net_3D/ (e.g. final_model_improved).",
+    )
+    parser.add_argument(
+        "--desktop-folder-name",
+        type=str,
+        default="动态色标空间对比",
+        help="Subfolder name under Desktop figures (must be <= 20 chars).",
+    )
+    args = parser.parse_args()
+    if len(args.desktop_folder_name) > 20:
+        raise ValueError(
+            f"Folder name '{args.desktop_folder_name}' exceeds 20 characters limit ({len(args.desktop_folder_name)} > 20)."
+        )
+
     paths = SubprojectPaths("U_Net_3D")
-    exp_dir = paths.get_exp_dir("final_model")
+    exp_dir = paths.get_exp_dir(args.exp_name)
 
     native_base = exp_dir / "evaluation" / "figures" / "spatial_leads"
-    desktop_base = Path(r"C:\Users\fired\OneDrive\Desktop\文献与汇报\02_自研课题与论文\ReMAP次季节降水预测\figures\动态色标空间对比")
+    desktop_base = (
+        Path(r"C:\Users\fired\OneDrive\Desktop\文献与汇报\02_自研课题与论文\ReMAP次季节降水预测\figures")
+        / args.desktop_folder_name
+    )
 
     native_base.mkdir(parents=True, exist_ok=True)
     desktop_base.mkdir(parents=True, exist_ok=True)

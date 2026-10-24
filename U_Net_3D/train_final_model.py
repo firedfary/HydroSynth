@@ -367,7 +367,11 @@ class RecencyTransferEngine:
         mapped = np.stack(
             [weighted_pattern_vector_row(row, self.point_weights) for row in mapped]
         )
-        return (1.0 - mapped_weight) * fold["eval_input"] + mapped_weight * mapped
+        mw = np.asarray(
+            [min(mapped_weight, 0.25) if SEASON_BY_MONTH[d.month] == "DJF" else mapped_weight for d in fold["eval_dates"]],
+            dtype=np.float32,
+        )[:, None]
+        return (1.0 - mw) * fold["eval_input"] + mw * mapped
 
     def evaluate_lead(self, lead: int) -> dict:
         dates = aligned_dates(self.raw_models["ECMWF"], lead)
@@ -446,6 +450,20 @@ def simplex_weights_grid(step: float = 0.05) -> np.ndarray:
     return np.asarray(rows, dtype=np.float32) / units
 
 
+def score_weights_sufficient(sources: np.ndarray, target: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Evaluate mean spatial correlation for all simplex weights via sufficient statistics."""
+    sources_c = sources - sources.mean(axis=2, keepdims=True)
+    target_c = target - target.mean(axis=1, keepdims=True)
+    st = np.einsum("nkp,np->nk", sources_c, target_c, optimize=True)
+    sg = np.einsum("nkp,nlp->nkl", sources_c, sources_c, optimize=True)
+    t_norm2 = np.sum(target_c**2, axis=1)
+    num = st @ weights.T
+    pred_norm2 = np.einsum("mk,nkl,ml->nm", weights, sg, weights, optimize=True)
+    den = np.sqrt(np.maximum(pred_norm2, 0.0) * np.maximum(t_norm2[:, None], 0.0))
+    corrs = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+    return corrs.mean(axis=0)
+
+
 class SeasonalStackingEngine:
     """Season-dependent convex forecast stacking with shrinkage to ECMWF."""
 
@@ -468,10 +486,22 @@ class SeasonalStackingEngine:
         ncep_anoms = anomalies_for_dates(self.raw_models["NCEP"], lead, train_dates, dates)
 
         ec_vectors = np.stack(
-            [standardize(np.nan_to_num(ec_anoms[d], nan=0.0), self.mask)[self.mask] for d in dates]
+            [
+                standardize(
+                    np.nan_to_num(transform_fractional_anomaly(ec_anoms[d], "signed_log1p"), nan=0.0),
+                    self.mask,
+                )[self.mask]
+                for d in dates
+            ]
         )
         ncep_vectors = np.stack(
-            [standardize(np.nan_to_num(ncep_anoms[d], nan=0.0), self.mask)[self.mask] for d in dates]
+            [
+                standardize(
+                    np.nan_to_num(transform_fractional_anomaly(ncep_anoms[d], "signed_log1p"), nan=0.0),
+                    self.mask,
+                )[self.mask]
+                for d in dates
+            ]
         )
 
         recent_vectors = []
@@ -539,19 +569,9 @@ class SeasonalStackingEngine:
                     shrink_diff = self.weights - np.asarray([1.0, 0.0, 0.0, 0.0])
                     reg = penalty * np.sum(shrink_diff**2, axis=1)
 
-                    # Maximize mean spatial correlation
-                    accs = []
-                    for w in self.weights:
-                        pred = (
-                            w[0] * ec[s_train]
-                            + w[1] * ncep[s_train]
-                            + w[2] * recent[s_train]
-                            + w[3] * annual[s_train]
-                        )
-                        pred = standardize_vectors(pred)
-                        dot = np.mean(np.sum(pred * target[s_train], axis=1) / target[s_train].shape[1])
-                        accs.append(dot)
-                    w_opt = self.weights[int(np.argmax(np.asarray(accs) - reg))]
+                    # Maximize mean spatial correlation via sufficient statistics
+                    accs = score_weights_sufficient(X_pool, target[s_train], self.weights)
+                    w_opt = self.weights[int(np.argmax(accs - reg))]
 
                     # Validate on validation slice
                     s_val = val_idx[season_mask[val_idx]]
@@ -573,18 +593,11 @@ class SeasonalStackingEngine:
             s_all = np.where(season_mask)[0]
             shrink_diff = self.weights - np.asarray([1.0, 0.0, 0.0, 0.0])
             reg = best_penalty * np.sum(shrink_diff**2, axis=1)
-            full_accs = []
-            for w in self.weights:
-                p = (
-                    w[0] * ec[s_all]
-                    + w[1] * ncep[s_all]
-                    + w[2] * recent[s_all]
-                    + w[3] * annual[s_all]
-                )
-                p = standardize_vectors(p)
-                dot = np.mean(np.sum(p * target[s_all], axis=1) / target[s_all].shape[1])
-                full_accs.append(dot)
-            best_w = self.weights[int(np.argmax(np.asarray(full_accs) - reg))]
+            X_all = np.stack(
+                [ec[s_all], ncep[s_all], recent[s_all], annual[s_all]], axis=1
+            )
+            full_accs = score_weights_sufficient(X_all, target[s_all], self.weights)
+            best_w = self.weights[int(np.argmax(full_accs - reg))]
             selected_weights_by_season[season] = best_w.tolist()
 
         # Fill OOF predictions across the 5 validation folds
@@ -663,14 +676,20 @@ def main():
         help="Path to reconstructed observation NPZ file.",
     )
     parser.add_argument(
+        "--exp-name",
+        type=str,
+        default="final_model",
+        help="Experiment name under results/U_Net_3D/ (e.g. final_model_improved).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=paths.get_exp_dir("final_model"),
+        default=None,
         help="Directory to save final model outputs and evaluation summaries.",
     )
     args = parser.parse_args()
 
-    out_dir = args.output_dir
+    out_dir = args.output_dir or paths.get_exp_dir(args.exp_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
@@ -732,12 +751,11 @@ def main():
     test_stacking = np.stack([r["test_predictions"] for r in stacking_results], axis=1)
     test_dates = transfer_results[0]["test_dates"]
 
-    # Assemble OOF targets
-    oof_dates = transfer_results[0]["oof_dates"]
+    # Assemble OOF targets (lead-specific OOF dates matching each lead's CV fold alignment)
     oof_targets = np.stack(
         [
-            np.stack([observations[date_to_idx[d]][mask] for d in oof_dates])
-            for _ in range(6)
+            np.stack([observations[date_to_idx[d]][mask] for d in transfer_results[lead]["oof_dates"]])
+            for lead in range(6)
         ],
         axis=1,
     )
@@ -750,9 +768,9 @@ def main():
     # Assemble ECMWF benchmark fields and Observation targets on test set
     test_obs = np.stack([observations[date_to_idx[d]] for d in test_dates])  # (21, 120, 140)
     test_ec_raw = np.zeros((NUM_TEST, 6, *mask.shape), dtype=np.float32)
-    train_dates = aligned_dates(raw_models["ECMWF"], 0)[:-NUM_TEST]
 
     for lead in range(6):
+        train_dates = aligned_dates(raw_models["ECMWF"], lead)[:-NUM_TEST]
         ec_anoms = anomalies_for_dates(raw_models["ECMWF"], lead, train_dates, test_dates)
         for i, d in enumerate(test_dates):
             field = transform_fractional_anomaly(ec_anoms[d], "signed_log1p")
@@ -819,6 +837,7 @@ def main():
                 "n_components": transfer_results[lead]["n_components"],
                 "alpha": transfer_results[lead]["alpha"],
                 "aux_weight": transfer_results[lead]["auxiliary_weight"],
+                "mapped_weight": transfer_results[lead]["mapped_weight"],
                 "recency_halflife_months": transfer_results[lead]["recency_halflife_months"],
             },
         })
