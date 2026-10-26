@@ -14,9 +14,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.decomposition import PCA
 from unetlitefilm import UNetLiteFiLM
-config.enable_auto_create_folders(True)
+config.enable_auto_create_folders(False)
 
-def compute_pcs_from_sst(sst_path, n_pcs=3, window=1, step=1):
+def compute_pcs_from_sst(sst_path, n_pcs=3, window=1, step=1, train_end=None):
     """
     读取 SST，计算 EOF PCs，并支持时间窗口拼接。
     """
@@ -29,17 +29,30 @@ def compute_pcs_from_sst(sst_path, n_pcs=3, window=1, step=1):
         print("Averaged month-dim:", sst.shape)
 
     T, H, W = sst.shape
-    sst_mean = np.nanmean(sst, axis=0, keepdims=True)
+    if train_end is None:
+        train_end = T - 21  # 默认最后 21 个月为测试集
+
+    # 1. 严格仅在训练期计算多年气候态均值并扣除
+    sst_mean = np.nanmean(sst[:train_end], axis=0, keepdims=True)
     sst_anom = sst - sst_mean
     X = sst_anom.reshape(T, -1)
     X[~np.isfinite(X)] = 0.0
 
+    # 2. 严格仅在训练期拟合 PCA 空间基底并正交投影
     pca = PCA(n_components=n_pcs, svd_solver='full')
-    pcs = pca.fit_transform(X)  # [T, n_pcs]
-    pcs = (pcs - pcs.mean(0, keepdims=True)) / (pcs.std(0, keepdims=True) + 1e-8)
+    pcs_train = pca.fit_transform(X[:train_end])
+    pcs_test = pca.transform(X[train_end:])
+
+    # 3. 严格仅基于训练期统计量进行标准化
+    train_pcs_mean = pcs_train.mean(0, keepdims=True)
+    train_pcs_std = pcs_train.std(0, keepdims=True) + 1e-8
+    pcs_train = (pcs_train - train_pcs_mean) / train_pcs_std
+    pcs_test = (pcs_test - train_pcs_mean) / train_pcs_std
+    pcs = np.concatenate([pcs_train, pcs_test], axis=0)
+
     eof_patterns = pca.components_.reshape(n_pcs, H, W)
 
-    print(f"PCA done. Explained variance={pca.explained_variance_ratio_.sum():.3f}")
+    print(f"PCA done (Train-only fit, train_end={train_end}). Explained variance={pca.explained_variance_ratio_.sum():.3f}")
 
     # --- 窗口拼接 ---
     pcs_window = []
