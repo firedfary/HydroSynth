@@ -48,9 +48,10 @@ def reference_predictions(paths, fold, seed, source, x_val, pc_val, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--tcc-weight", type=float, default=0.0)
     parser.add_argument("--experiment", default="film_tcc_select_v1")
     args = parser.parse_args()
-    if (args.epochs <= 0 or not args.experiment or "/" in args.experiment or
+    if (args.epochs <= 0 or args.tcc_weight < 0 or not args.experiment or "/" in args.experiment or
             "\\" in args.experiment):
         parser.error("invalid epochs or experiment name")
     paths = SubprojectPaths(__file__)
@@ -67,7 +68,8 @@ def main():
             "candidate": "shallow zero-PC-identity FiLM with TCC checkpoint selection",
             "sources": SOURCE, "seeds": list(SEEDS), "epochs": args.epochs,
             "architecture": "frozen 32-channel Baseline, FiLM levels 1-4, 30 SST PCs",
-            "training": "masked MSE plus 0.1 FiLM penalty; AdamW 2e-4",
+            "training": "masked MSE plus 0.1 FiLM penalty and optional batch TCC loss; AdamW 2e-4",
+            "tcc_weight": args.tcc_weight,
             "checkpoint_selection": "validation mean TCC, including epoch 0",
             "references": "existing ACC-selected Baseline, 30-PC EOF-cat, and shallow FiLM",
             "gate": "candidate ensemble TCC and significant-grid coverage exceed all references on every fold",
@@ -124,7 +126,7 @@ def main():
                 "tcc_selected", (1, 2, 3, 4), 0.0, base_weights,
                 dataset, val_arrays, ref_metrics["baseline"]["mean_acc"],
                 device, args.epochs, seed, selection_metric="mean_tcc",
-                include_baseline=True,
+                include_baseline=True, tcc_weight=args.tcc_weight,
             )
             torch.save(model.state_dict(), exp_dir / "checkpoints" /
                        f"{fold}_s{seed}.pt")

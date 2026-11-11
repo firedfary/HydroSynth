@@ -33,11 +33,32 @@ CANDIDATES = {
 FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fair_s44"}
 
 
+def temporal_corr(pred, target, mask):
+    good = ~mask
+    count = good.sum(dim=0).clamp_min(1)
+    pred_valid = torch.where(good, pred, 0)
+    target_valid = torch.where(good, target, 0)
+    pred_mean = pred_valid.sum(dim=0) / count
+    target_mean = target_valid.sum(dim=0) / count
+    pred_centered = torch.where(good, pred_valid - pred_mean, 0)
+    target_centered = torch.where(good, target_valid - target_mean, 0)
+    pred_ss = pred_centered.square().sum(dim=0)
+    target_ss = target_centered.square().sum(dim=0)
+    eligible = (count >= 5) & (pred_ss > 1e-6) & (target_ss > 1e-6)
+    if not eligible.any():
+        return pred.sum() * 0.0
+    covariance = (pred_centered * target_centered).sum(dim=0)
+    corr = covariance / (pred_ss.clamp_min(1e-8) *
+                         target_ss.clamp_min(1e-8)).sqrt()
+    return corr[eligible].mean()
+
+
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
                     loss_name="mse", reference_zero_dims=None, affine_mode="full",
                     index_hidden=16, spatial_film=False, spatial_per_channel=False,
-                    selection_metric="mean_acc", include_baseline=False):
+                    selection_metric="mean_acc", include_baseline=False,
+                    tcc_weight=0.0):
     set_seed(seed)
     model = UNetLiteFiLM(
         n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32,
@@ -74,6 +95,8 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
         raise ValueError("loss_name must be mse or huber1")
     if selection_metric not in ("mean_acc", "mean_tcc"):
         raise ValueError("selection_metric must be mean_acc or mean_tcc")
+    if tcc_weight < 0:
+        raise ValueError("tcc_weight must be nonnegative")
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=2e-4,
                                   weight_decay=1e-4)
@@ -111,6 +134,7 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                          F.mse_loss(pred[~mask], target[~mask]))
             loss = (data_loss +
                     acc_weight * (1.0 - spatial_acc(pred, target, mask)) +
+                    tcc_weight * (1.0 - temporal_corr(pred, target, mask)) +
                     0.1 * penalty)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 2.0)
