@@ -114,12 +114,13 @@ class UNetLiteFiLM(nn.Module):
     """
     def __init__(self, n_channels=10, n_classes=1, index_dim=3,
                  base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
-                 film_layers=None, identity_init=False):
+                 film_layers=None, identity_init=False, zero_pc_identity=False):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
         self.film_layers = frozenset(range(5) if film_layers is None else film_layers)
+        self.zero_pc_identity = zero_pc_identity
         if not self.film_layers.issubset(range(5)):
             raise ValueError("film_layers must contain encoder levels 0 through 4")
 
@@ -153,6 +154,10 @@ class UNetLiteFiLM(nn.Module):
         indices: [B,K] (global indices)
         """
         gammas, betas = self.index_encoder(indices)
+        if self.zero_pc_identity:
+            zero_gammas, zero_betas = self.index_encoder(torch.zeros_like(indices))
+            gammas = [gamma - zero for gamma, zero in zip(gammas, zero_gammas)]
+            betas = [beta - zero for beta, zero in zip(betas, zero_betas)]
         if film_gain != 1.0:
             gammas = [gamma * film_gain for gamma in gammas]
             betas = [beta * film_gain for beta in betas]

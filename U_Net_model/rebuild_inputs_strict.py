@@ -89,16 +89,32 @@ def load_raw_fields(raw_dir, dates):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--fit-end", default="2017-12-01")
+    parser.add_argument("--validation-end", default="2022-12-01")
+    parser.add_argument("--cache-name", default="strict_inputs")
     args = parser.parse_args()
     dates = build_date_index()
-    train_mask = np.asarray(dates <= "2017-12-01")
+    if (args.cache_name in ("", ".", "..") or
+            "/" in args.cache_name or "\\" in args.cache_name or
+            pd.Timestamp(args.fit_end) >= pd.Timestamp(args.validation_end)):
+        parser.error("cache-name must be a directory name and fit-end must precede validation-end")
+    train_mask = np.asarray(dates <= args.fit_end)
+    val_mask = np.asarray((dates > args.fit_end) & (dates <= args.validation_end))
+    test_mask = np.asarray(dates > args.validation_end)
+    if not train_mask.any() or not val_mask.any() or not test_mask.any():
+        parser.error("fit, validation, and later periods must all contain months")
     paths = SubprojectPaths(__file__)
-    cache_dir = paths.cache_dir / "strict_inputs"
+    cache_dir = paths.cache_dir / args.cache_name
     input_path = cache_dir / "cond_trainfit.npy"
     params_path = cache_dir / "preprocess_params.npz"
     manifest_path = cache_dir / "manifest.json"
     if args.verify_only:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_validation = "2018-01/2022-12" if args.cache_name == "strict_inputs" else None
+        if (manifest["train_period"] != f"1994-01/{args.fit_end[:7]}" or
+                manifest.get("validation_period", legacy_validation) !=
+                f"{dates[val_mask][0]:%Y-%m}/{args.validation_end[:7]}"):
+            raise ValueError("cache manifest belongs to a different time fold")
         values = np.load(input_path, mmap_mode="r")
         assert values.shape == (366, 10, 120, 140)
         assert np.isfinite(values).all()
@@ -122,7 +138,8 @@ def main():
     digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
     manifest = {
         "source": str(raw_dir), "period": "1994-01/2024-09", "months": len(dates),
-        "train_period": "1994-01/2017-12", "train_months": int(train_mask.sum()),
+        "train_period": f"1994-01/{args.fit_end[:7]}", "train_months": int(train_mask.sum()),
+        "validation_period": f"{dates[val_mask][0]:%Y-%m}/{args.validation_end[:7]}",
         "excluded_months": ["2011-09", "2011-10", "2017-01"],
         "variables": list(VARIABLES), "interpolation": "bicubic, factor 2",
         "precipitation_conversion": "fixed 31-day factor, matching prior pipeline",
@@ -132,8 +149,8 @@ def main():
             [float(normalized[train_mask, channel].min()), float(normalized[train_mask, channel].max())]
             for channel in range(len(VARIABLES))
         ],
-        "val_outside_unit_pct": float((np.abs(normalized[285:345]) > 1).mean() * 100),
-        "test_outside_unit_pct": float((np.abs(normalized[345:]) > 1).mean() * 100),
+        "val_outside_unit_pct": float((np.abs(normalized[val_mask]) > 1).mean() * 100),
+        "test_outside_unit_pct": float((np.abs(normalized[test_mask]) > 1).mean() * 100),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Saved {input_path} with sha256 {digest}", flush=True)
