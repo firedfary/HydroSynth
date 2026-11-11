@@ -36,7 +36,8 @@ FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fai
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
                     loss_name="mse", reference_zero_dims=None, affine_mode="full",
-                    index_hidden=16, spatial_film=False, spatial_per_channel=False):
+                    index_hidden=16, spatial_film=False, spatial_per_channel=False,
+                    selection_metric="mean_acc", include_baseline=False):
     set_seed(seed)
     model = UNetLiteFiLM(
         n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32,
@@ -71,11 +72,21 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
         raise ValueError("condition_dropout must be in [0, 1)")
     if loss_name not in ("mse", "huber1"):
         raise ValueError("loss_name must be mse or huber1")
+    if selection_metric not in ("mean_acc", "mean_tcc"):
+        raise ValueError("selection_metric must be mean_acc or mean_tcc")
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=2e-4,
                                   weight_decay=1e-4)
-    best_acc, best_epoch, best_state = -float("inf"), 0, None
+    best_score, best_epoch, best_state = -float("inf"), 0, None
     history = []
+    if include_baseline:
+        initial = summary(predict(model, "film32_identity", x_val, pcs_val, device),
+                          y_val, valid, p90)[0]
+        best_score = initial[selection_metric]
+        best_state = {key: value.detach().cpu().clone()
+                      for key, value in model.state_dict().items()}
+        history.append({"epoch": 0, "val_acc": initial["mean_acc"],
+                        "val_tcc": initial["mean_tcc"], "val_rmse": initial["rmse"]})
     for epoch in range(1, epochs + 1):
         model.eval()
         for target, cond, mask, pcs in loader:
@@ -106,15 +117,17 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
             optimizer.step()
         val_pred = predict(model, "film32_identity", x_val, pcs_val, device)
         val, _ = summary(val_pred, y_val, valid, p90)
-        val_acc = val["mean_acc"]
-        history.append({"epoch": epoch, "val_acc": val_acc, "val_rmse": val["rmse"]})
-        if val_acc > best_acc:
-            best_acc, best_epoch = val_acc, epoch
+        score = val[selection_metric]
+        history.append({"epoch": epoch, "val_acc": val["mean_acc"],
+                        "val_tcc": val["mean_tcc"], "val_rmse": val["rmse"]})
+        if score > best_score:
+            best_score, best_epoch = score, epoch
             best_state = {key: value.detach().cpu().clone()
                           for key, value in model.state_dict().items()}
         if epoch == 1 or epoch % 20 == 0:
-            print(f"seed={seed} {name} epoch={epoch} val_acc={val_acc:.4f} "
-                  f"best={best_acc:.4f} baseline={baseline_val_acc:.4f}", flush=True)
+            print(f"seed={seed} {name} epoch={epoch} "
+                  f"val_{selection_metric}={score:.4f} best={best_score:.4f} "
+                  f"baseline_acc={baseline_val_acc:.4f}", flush=True)
 
     model.load_state_dict(best_state)
     val_pred = predict(model, "film32_identity", x_val, pcs_val, device)
@@ -123,6 +136,7 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
     val, _ = summary(val_pred, y_val, valid, p90)
     zero, _ = summary(val_zero, y_val, valid, p90)
     info = {"best_epoch": best_epoch, "validation": val, "validation_pc_zero": zero,
+            "selection_metric": selection_metric, "best_score": best_score,
             "transfer_max_abs_diff": transfer_diff, "history": history}
     return model, info, val_pred
 
