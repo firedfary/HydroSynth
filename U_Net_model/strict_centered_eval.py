@@ -35,12 +35,12 @@ FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fai
 
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
-                    loss_name="mse", reference_zero_dims=None):
+                    loss_name="mse", reference_zero_dims=None, affine_mode="full"):
     set_seed(seed)
     model = UNetLiteFiLM(
         n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32, index_hidden=16,
         dropout=0.1, film_layers=layers, identity_init=True, zero_pc_identity=True,
-        reference_zero_dims=reference_zero_dims,
+        reference_zero_dims=reference_zero_dims, affine_mode=affine_mode,
     ).to(device)
     missing, unexpected = model.load_state_dict(base_weights, strict=False)
     if unexpected or any(not key.startswith("index_encoder.") for key in missing):
@@ -82,8 +82,10 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
             gammas, betas = model.index_encoder(pcs)
             zero_gammas, zero_betas = model.index_encoder(model.reference_indices(pcs))
             penalty = sum(
-                (gammas[level] - zero_gammas[level]).square().mean() +
-                (betas[level] - zero_betas[level]).square().mean()
+                (0 if affine_mode == "shift" else
+                 (gammas[level] - zero_gammas[level]).square().mean()) +
+                (0 if affine_mode == "scale" else
+                 (betas[level] - zero_betas[level]).square().mean())
                 for level in layers
             ) / len(layers)
             data_loss = (F.huber_loss(pred[~mask], target[~mask], delta=1.0)

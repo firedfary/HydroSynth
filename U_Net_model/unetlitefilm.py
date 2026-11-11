@@ -115,7 +115,7 @@ class UNetLiteFiLM(nn.Module):
     def __init__(self, n_channels=10, n_classes=1, index_dim=3,
                  base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
                  film_layers=None, identity_init=False, zero_pc_identity=False,
-                 reference_zero_dims=None):
+                 reference_zero_dims=None, affine_mode="full"):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -123,6 +123,9 @@ class UNetLiteFiLM(nn.Module):
         self.film_layers = frozenset(range(5) if film_layers is None else film_layers)
         self.zero_pc_identity = zero_pc_identity
         self.reference_zero_dims = index_dim if reference_zero_dims is None else reference_zero_dims
+        if affine_mode not in ("full", "scale", "shift"):
+            raise ValueError("affine_mode must be full, scale, or shift")
+        self.affine_mode = affine_mode
         if not 0 <= self.reference_zero_dims <= index_dim:
             raise ValueError("reference_zero_dims must be within index_dim")
         if not self.film_layers.issubset(range(9)):
@@ -171,6 +174,10 @@ class UNetLiteFiLM(nn.Module):
             zero_gammas, zero_betas = self.index_encoder(self.reference_indices(indices))
             gammas = [gamma - zero for gamma, zero in zip(gammas, zero_gammas)]
             betas = [beta - zero for beta, zero in zip(betas, zero_betas)]
+        if self.affine_mode == "scale":
+            betas = [torch.zeros_like(beta) for beta in betas]
+        elif self.affine_mode == "shift":
+            gammas = [torch.zeros_like(gamma) for gamma in gammas]
         if film_gain != 1.0:
             gammas = [gamma * film_gain for gamma in gammas]
             betas = [beta * film_gain for beta in betas]
