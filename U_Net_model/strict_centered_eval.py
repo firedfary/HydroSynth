@@ -36,22 +36,23 @@ FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fai
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
                     loss_name="mse", reference_zero_dims=None, affine_mode="full",
-                    index_hidden=16, spatial_film=False):
+                    index_hidden=16, spatial_film=False, spatial_per_channel=False):
     set_seed(seed)
     model = UNetLiteFiLM(
         n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32,
         index_hidden=index_hidden,
         dropout=0.1, film_layers=layers, identity_init=True, zero_pc_identity=True,
         reference_zero_dims=reference_zero_dims, affine_mode=affine_mode,
-        spatial_film=spatial_film,
+        spatial_film=spatial_film, spatial_per_channel=spatial_per_channel,
     ).to(device)
     missing, unexpected = model.load_state_dict(base_weights, strict=False)
     if unexpected or any(not (key.startswith("index_encoder.") or
-                              (spatial_film and key == "spatial_coeffs")) for key in missing):
+                              (spatial_film and key.startswith("spatial_coeffs")))
+                         for key in missing):
         raise RuntimeError(f"baseline transfer mismatch: {missing}, {unexpected}")
     for key, parameter in model.named_parameters():
         parameter.requires_grad_(key.startswith("index_encoder.") or
-                                 (spatial_film and key == "spatial_coeffs"))
+                                 (spatial_film and key.startswith("spatial_coeffs")))
     model.eval()
     x_val, pcs_val, y_val, valid, p90 = val_arrays
     with torch.no_grad():

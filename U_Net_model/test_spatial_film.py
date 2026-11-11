@@ -57,6 +57,25 @@ class SpatialFiLMTest(unittest.TestCase):
             after = self.spatial(self.x, self.pcs)
         self.assertGreater(float((before - after).abs().max()), 1e-6)
 
+    def test_channel_spatial_film_identity_and_local_effect(self):
+        channel = UNetLiteFiLM(
+            n_channels=10, index_dim=30, base_filters=32, index_hidden=16,
+            dropout=0.1, film_layers=(1, 2, 3, 4), identity_init=True,
+            zero_pc_identity=True, spatial_film=True, spatial_per_channel=True,
+        ).eval()
+        missing, unexpected = channel.load_state_dict(self.legacy.state_dict(), strict=False)
+        self.assertFalse(unexpected)
+        self.assertTrue(all(key.startswith("spatial_coeffs.") for key in missing))
+        with torch.no_grad():
+            expected = self.baseline(self.x)
+            zero = channel(self.x, torch.zeros_like(self.pcs))
+            channel.index_encoder.gammas[1].weight.fill_(0.2)
+            before = channel(self.x, self.pcs)
+            channel.spatial_coeffs[1][:, 0] = 1.0
+            after = channel(self.x, self.pcs)
+        self.assertTrue(torch.equal(zero, expected))
+        self.assertGreater(float((before - after).abs().max()), 1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

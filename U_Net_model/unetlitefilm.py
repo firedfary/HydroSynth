@@ -115,7 +115,8 @@ class UNetLiteFiLM(nn.Module):
     def __init__(self, n_channels=10, n_classes=1, index_dim=3,
                  base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
                  film_layers=None, identity_init=False, zero_pc_identity=False,
-                 reference_zero_dims=None, affine_mode="full", spatial_film=False):
+                 reference_zero_dims=None, affine_mode="full", spatial_film=False,
+                 spatial_per_channel=False):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -127,6 +128,9 @@ class UNetLiteFiLM(nn.Module):
             raise ValueError("affine_mode must be full, scale, or shift")
         self.affine_mode = affine_mode
         self.spatial_film = spatial_film
+        self.spatial_per_channel = spatial_per_channel
+        if spatial_per_channel and not spatial_film:
+            raise ValueError("spatial_per_channel requires spatial_film")
         if not 0 <= self.reference_zero_dims <= index_dim:
             raise ValueError("reference_zero_dims must be within index_dim")
         if not self.film_layers.issubset(range(9)):
@@ -159,7 +163,12 @@ class UNetLiteFiLM(nn.Module):
                 nn.init.zeros_(head.weight)
                 nn.init.zeros_(head.bias)
         if spatial_film:
-            self.spatial_coeffs = nn.Parameter(torch.zeros(9, 3))
+            if spatial_per_channel:
+                self.spatial_coeffs = nn.ParameterList(
+                    [nn.Parameter(torch.zeros(channels, 3)) for channels in feature_dims]
+                )
+            else:
+                self.spatial_coeffs = nn.Parameter(torch.zeros(9, 3))
 
     def _apply_film(self, x, gamma, beta, level):
         if not self.spatial_film:
@@ -168,8 +177,14 @@ class UNetLiteFiLM(nn.Module):
         xx = torch.linspace(-1.0, 1.0, x.shape[-1], device=x.device, dtype=x.dtype)
         lat = yy[:, None]
         lon = xx[None, :]
-        a, b, c = self.spatial_coeffs[level].tanh()
-        spatial = 1.0 + 0.25 * (a * lat + b * lon + c * lat * lon)
+        if self.spatial_per_channel:
+            a, b, c = self.spatial_coeffs[level].tanh().unbind(dim=-1)
+            spatial = 1.0 + 0.25 * (a[:, None, None] * lat +
+                                    b[:, None, None] * lon +
+                                    c[:, None, None] * lat * lon)
+        else:
+            a, b, c = self.spatial_coeffs[level].tanh()
+            spatial = 1.0 + 0.25 * (a * lat + b * lon + c * lat * lon)
         return x * (1.0 + gamma[:, :, None, None] * spatial) + beta[:, :, None, None] * spatial
 
     def reference_indices(self, indices):
