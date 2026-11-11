@@ -35,10 +35,12 @@ FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fai
 
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
-                    loss_name="mse", reference_zero_dims=None, affine_mode="full"):
+                    loss_name="mse", reference_zero_dims=None, affine_mode="full",
+                    index_hidden=16):
     set_seed(seed)
     model = UNetLiteFiLM(
-        n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32, index_hidden=16,
+        n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32,
+        index_hidden=index_hidden,
         dropout=0.1, film_layers=layers, identity_init=True, zero_pc_identity=True,
         reference_zero_dims=reference_zero_dims, affine_mode=affine_mode,
     ).to(device)
