@@ -114,15 +114,19 @@ class UNetLiteFiLM(nn.Module):
     """
     def __init__(self, n_channels=10, n_classes=1, index_dim=3,
                  base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
-                 film_layers=None, identity_init=False, zero_pc_identity=False):
+                 film_layers=None, identity_init=False, zero_pc_identity=False,
+                 reference_zero_dims=None):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
         self.film_layers = frozenset(range(5) if film_layers is None else film_layers)
         self.zero_pc_identity = zero_pc_identity
-        if not self.film_layers.issubset(range(5)):
-            raise ValueError("film_layers must contain encoder levels 0 through 4")
+        self.reference_zero_dims = index_dim if reference_zero_dims is None else reference_zero_dims
+        if not 0 <= self.reference_zero_dims <= index_dim:
+            raise ValueError("reference_zero_dims must be within index_dim")
+        if not self.film_layers.issubset(range(9)):
+            raise ValueError("film_layers must contain encoder levels 0-4 or decoder levels 5-8")
 
         # Encoder
         self.inc = DoubleConv(n_channels, base_filters, dropout=dropout)
@@ -142,11 +146,20 @@ class UNetLiteFiLM(nn.Module):
         # Index encoder
         feature_dims = [base_filters, base_filters*2, base_filters*4,
                         base_filters*8, base_filters*16 // factor]
+        if any(level >= 5 for level in self.film_layers):
+            feature_dims += [base_filters*8 // factor, base_filters*4 // factor,
+                             base_filters*2 // factor, base_filters]
         self.index_encoder = IndexEncoder(index_dim, index_hidden, feature_dims)
         if identity_init:
             for head in (*self.index_encoder.gammas, *self.index_encoder.betas):
                 nn.init.zeros_(head.weight)
                 nn.init.zeros_(head.bias)
+
+    def reference_indices(self, indices):
+        if self.reference_zero_dims == indices.shape[1]:
+            return torch.zeros_like(indices)
+        return torch.cat((torch.zeros_like(indices[:, :self.reference_zero_dims]),
+                          indices[:, self.reference_zero_dims:]), dim=1)
 
     def forward(self, x, indices, film_gain=1.0):
         """
@@ -155,7 +168,7 @@ class UNetLiteFiLM(nn.Module):
         """
         gammas, betas = self.index_encoder(indices)
         if self.zero_pc_identity:
-            zero_gammas, zero_betas = self.index_encoder(torch.zeros_like(indices))
+            zero_gammas, zero_betas = self.index_encoder(self.reference_indices(indices))
             gammas = [gamma - zero for gamma, zero in zip(gammas, zero_gammas)]
             betas = [beta - zero for beta, zero in zip(betas, zero_betas)]
         if film_gain != 1.0:
@@ -183,9 +196,17 @@ class UNetLiteFiLM(nn.Module):
             x5 = apply_film(x5, gammas[4], betas[4])
 
         x = self.up1(x5, x4)
+        if 5 in self.film_layers:
+            x = apply_film(x, gammas[5], betas[5])
         x = self.up2(x, x3)
+        if 6 in self.film_layers:
+            x = apply_film(x, gammas[6], betas[6])
         x = self.up3(x, x2)
+        if 7 in self.film_layers:
+            x = apply_film(x, gammas[7], betas[7])
         x = self.up4(x, x1)
+        if 8 in self.film_layers:
+            x = apply_film(x, gammas[8], betas[8])
         logits = self.outc(x)
         return logits
 

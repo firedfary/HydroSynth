@@ -34,11 +34,13 @@ FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fai
 
 
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
-                    baseline_val_acc, device, epochs, seed):
+                    baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
+                    loss_name="mse", reference_zero_dims=None):
     set_seed(seed)
     model = UNetLiteFiLM(
-        n_channels=10, index_dim=5, base_filters=32, index_hidden=16,
+        n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32, index_hidden=16,
         dropout=0.1, film_layers=layers, identity_init=True, zero_pc_identity=True,
+        reference_zero_dims=reference_zero_dims,
     ).to(device)
     missing, unexpected = model.load_state_dict(base_weights, strict=False)
     if unexpected or any(not key.startswith("index_encoder.") for key in missing):
@@ -49,7 +51,7 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
     x_val, pcs_val, y_val, valid, p90 = val_arrays
     with torch.no_grad():
         zero_pred = predict(model, "film32_identity", x_val[:2],
-                            torch.zeros_like(pcs_val[:2]), device)
+                            model.reference_indices(pcs_val[:2]), device)
     reference = UNetLite(n_channels=10, base_filters=32, dropout=0.1).to(device)
     reference.load_state_dict(base_weights)
     base_pred = predict(reference, "baseline32", x_val[:2], pcs_val[:2], device)
@@ -59,6 +61,10 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
     del reference
 
     loader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True)
+    if not 0.0 <= condition_dropout < 1.0:
+        raise ValueError("condition_dropout must be in [0, 1)")
+    if loss_name not in ("mse", "huber1"):
+        raise ValueError("loss_name must be mse or huber1")
     optimizer = torch.optim.AdamW(model.index_encoder.parameters(), lr=2e-4,
                                   weight_decay=1e-4)
     best_acc, best_epoch, best_state = -float("inf"), 0, None
@@ -68,15 +74,22 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
         for target, cond, mask, pcs in loader:
             target, cond, mask, pcs = (item.to(device) for item in (target, cond, mask, pcs))
             optimizer.zero_grad(set_to_none=True)
-            pred = model(cond, pcs)
+            train_pcs = pcs
+            if condition_dropout:
+                keep = (torch.rand(len(pcs), 1, device=device) >= condition_dropout)
+                train_pcs = torch.where(keep, pcs, model.reference_indices(pcs))
+            pred = model(cond, train_pcs)
             gammas, betas = model.index_encoder(pcs)
-            zero_gammas, zero_betas = model.index_encoder(torch.zeros_like(pcs))
+            zero_gammas, zero_betas = model.index_encoder(model.reference_indices(pcs))
             penalty = sum(
                 (gammas[level] - zero_gammas[level]).square().mean() +
                 (betas[level] - zero_betas[level]).square().mean()
                 for level in layers
             ) / len(layers)
-            loss = (F.mse_loss(pred[~mask], target[~mask]) +
+            data_loss = (F.huber_loss(pred[~mask], target[~mask], delta=1.0)
+                         if loss_name == "huber1" else
+                         F.mse_loss(pred[~mask], target[~mask]))
+            loss = (data_loss +
                     acc_weight * (1.0 - spatial_acc(pred, target, mask)) +
                     0.1 * penalty)
             loss.backward()
@@ -97,7 +110,7 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
     model.load_state_dict(best_state)
     val_pred = predict(model, "film32_identity", x_val, pcs_val, device)
     val_zero = predict(model, "film32_identity", x_val,
-                       torch.zeros_like(pcs_val), device)
+                       model.reference_indices(pcs_val), device)
     val, _ = summary(val_pred, y_val, valid, p90)
     zero, _ = summary(val_zero, y_val, valid, p90)
     info = {"best_epoch": best_epoch, "validation": val, "validation_pc_zero": zero,

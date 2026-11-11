@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Unified Leak-Free Training, Hyperparameter Alignment, Evaluation, and Interpretability Pipeline
+Legacy unified training, evaluation, and interpretability pipeline
 for FiLM-U-Net Monthly Precipitation Prediction over China (EJRH-D-26-03375).
 
-Key methodological guarantees:
-1. Strict chronological split inside 1994.01-2022.12:
+Important protocol notes:
+1. Chronological split:
    - Training set:            1994.01 - 2017.12 (285 months)
    - Internal validation set: 2018.01 - 2022.12 (60 months, used for early stopping & hyperparameter selection)
-   - Independent test set:    2023.01 - 2024.09 (21 months, 100% isolated from all fitting/selection)
-2. Zero data leakage:
-   - SST climatology, EOF spatial basis, PC standardization statistics, and extreme p90 threshold
-     are fitted strictly on the 285-month training window (1994.01-2017.12) and projected out-of-sample.
-3. Identical architectural and tuning budget across Baseline U-Net, EOF-cat (n_pcs=5), and FiLM-U-Net (n_pcs=5).
-4. Additional 2020.01-2021.12 (24-month mixed-ENSO) rolling holdout sensitivity benchmark.
-5. Complete statistical testing (paired Wilcoxon, month-wise & year-blocked bootstrap 95% CIs),
-   regional hydroclimatic attribution, permutation feature importance, ENSO phase stratification,
-   and symmetric interpretability ablations + shuffled-PC negative controls (Figs. 6-9, Tables 1-5).
+   - Explored evaluation set: 2023.01 - 2024.09 (21 months). This period has been
+     examined repeatedly and is no longer an independent final test.
+2. SST climatology, EOF basis, PC scaling, and extreme p90 threshold use the
+   training period. The legacy meteorological predictor cache used by this script
+   was normalized on the full series and has leakage. Use rebuild_inputs_strict.py
+   and the strict_* evaluation scripts for train-fitted predictors.
+3. The legacy model comparison also changes backbone width between models;
+   it cannot isolate the effect of FiLM conditioning.
 """
 
 import argparse
@@ -68,13 +67,21 @@ def build_date_index():
     return dates_all
 
 
-def compute_strict_sst_pcs(sst_raw: np.ndarray, fit_mask: np.ndarray, n_pcs: int = 5):
+def compute_strict_sst_pcs(sst_raw: np.ndarray, fit_mask: np.ndarray,
+                           n_pcs: int = 5, window_months: int = 6,
+                           keep_lags: bool = False):
     """
     Compute SST EOF patterns and standardized PCs strictly fitted on `fit_mask` timesteps.
+    A four-dimensional input stores preceding months oldest to newest; average only
+    the most recent `window_months` to form one SST field per target month.
+    With `keep_lags`, project each month onto that same EOF basis and retain
+    the oldest-to-newest PC sequence instead of averaging the PC scores.
     Also enforces canonical El Nino positive sign convention on PC1 (warm eastern equatorial Pacific).
     """
     if sst_raw.ndim == 4:
-        sst = np.mean(sst_raw, axis=1)  # [T, 89, 180]
+        if not 1 <= window_months <= sst_raw.shape[1]:
+            raise ValueError("window_months must be within the stored SST lag window")
+        sst = np.mean(sst_raw[:, -window_months:], axis=1)  # [T, 89, 180]
     else:
         sst = sst_raw.copy()
 
@@ -91,6 +98,14 @@ def compute_strict_sst_pcs(sst_raw: np.ndarray, fit_mask: np.ndarray, n_pcs: int
     mean_val = pcs_all[fit_mask].mean(axis=0, keepdims=True)
     std_val = pcs_all[fit_mask].std(axis=0, keepdims=True) + 1e-8
     pcs_std = (pcs_all - mean_val) / std_val
+    if keep_lags:
+        if sst_raw.ndim != 4:
+            raise ValueError("keep_lags requires a time-by-lag SST input")
+        lag_anom = sst_raw[:, -window_months:] - sst_mean[:, None]
+        lag_x = lag_anom.reshape(T * window_months, -1)
+        lag_x[~np.isfinite(lag_x)] = 0.0
+        lag_scores = pca.transform(lag_x).reshape(T, window_months, n_pcs)
+        pcs_std = (lag_scores - mean_val) / std_val
     eof_patterns = pca.components_.reshape(n_pcs, H, W).copy()
 
     # Enforce canonical El Nino sign on PC1 using true NOAA ERSST v5 coordinates (-88..88N, 0..358E)
@@ -100,8 +115,11 @@ def compute_strict_sst_pcs(sst_raw: np.ndarray, fit_mask: np.ndarray, n_pcs: int
     lon_mask = (lons >= 190.0) & (lons <= 240.0)
     nino34_loading = np.nanmean(eof_patterns[0][np.ix_(lat_mask, lon_mask)])
     if nino34_loading < 0:
-        pcs_std[:, 0] *= -1.0
+        pcs_std[..., 0] *= -1.0
         eof_patterns[0] *= -1.0
+
+    if keep_lags:
+        pcs_std = pcs_std.reshape(T, window_months * n_pcs)
 
     return (
         pcs_std.astype(np.float32),
