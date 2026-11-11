@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--condition-dropout", type=float, default=0.0)
     parser.add_argument("--film-layers", default="3,4")
     parser.add_argument("--loss", choices=("mse", "huber1"), default="mse")
+    parser.add_argument("--acc-weight", type=float, default=0.0)
     parser.add_argument("--season", action="store_true")
     args = parser.parse_args()
     try:
@@ -40,8 +41,9 @@ def main():
     if (args.epochs <= 0 or not args.experiment or "/" in args.experiment or
             "\\" in args.experiment or not 0.0 <= args.condition_dropout < 1.0 or
             not layers or len(set(layers)) != len(layers) or
-            any(level < 0 or level > 8 for level in layers)):
-        parser.error("invalid experiment, dropout, or film-layers")
+            any(level < 0 or level > 8 for level in layers) or
+            not np.isfinite(args.acc_weight) or args.acc_weight < 0):
+        parser.error("invalid experiment, dropout, film-layers, or ACC weight")
     paths = SubprojectPaths(__file__)
     exp_dir = paths.results_dir / args.experiment
     if exp_dir.exists():
@@ -60,11 +62,12 @@ def main():
                      "architecture": "zero-PC-identity FiLM, hidden 16, frozen Baseline",
                      "film_layers": list(layers),
                      "loss": args.loss,
+                     "acc_weight": args.acc_weight,
                      "season_features": "target-month sine and cosine" if args.season else None,
                      "epochs": args.epochs, "seeds": list(SEEDS),
                      "condition_dropout": args.condition_dropout,
                      "checkpoint_selection": "validation ACC",
-                     "holdout_gate": "both fold mean validation ACC exceed averaged-W6, Baseline, and the no-dropout trajectory when applicable",
+                     "holdout_gate": "both fold mean validation ACC exceed averaged-W6, Baseline, and the original trajectory when applicable",
                      "holdout_status": "previously inspected periods are exploratory"},
         "folds": {},
     }
@@ -95,13 +98,15 @@ def main():
                        "sst_pca_explained_variance": [float(v) for v in explained],
                        "seeds": {}}
         prior_trajectory = None
-        if args.condition_dropout or layers != (3, 4) or args.loss != "mse" or args.season:
+        if (args.condition_dropout or layers != (3, 4) or args.loss != "mse" or
+                args.season or args.acc_weight):
             prior_trajectory = json.loads((paths.results_dir / "strict_trajectory_v1" /
                                            "trajectory_metrics.json").read_text(encoding="utf-8"))
         for seed in SEEDS:
             prior_base, prior_avg6 = prior_validation(paths, fold, seed)
             model, info, val_pred = train_candidate(
-                "trajectory6", layers, 0.0, baseline_weights(paths, fold, seed),
+                "trajectory6", layers, args.acc_weight,
+                baseline_weights(paths, fold, seed),
                 train_ds, val_arrays, prior_base, device, args.epochs, seed,
                 condition_dropout=args.condition_dropout,
                 loss_name=args.loss,
@@ -133,7 +138,8 @@ def main():
             "trajectory6": float(np.mean([rows[str(seed)]["trajectory"]["validation"]["mean_acc"]
                                           for seed in SEEDS])),
         }
-        if args.condition_dropout or layers != (3, 4) or args.loss != "mse" or args.season:
+        if (args.condition_dropout or layers != (3, 4) or args.loss != "mse" or
+                args.season or args.acc_weight):
             fold_means[fold]["no_dropout"] = float(np.mean([
                 rows[str(seed)]["no_dropout_val_acc"] for seed in SEEDS
             ]))
