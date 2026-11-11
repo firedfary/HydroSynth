@@ -36,19 +36,22 @@ FAIR_EXPERIMENTS = {42: "strict_fair_v1", 43: "strict_fair_s43", 44: "strict_fai
 def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     baseline_val_acc, device, epochs, seed, condition_dropout=0.0,
                     loss_name="mse", reference_zero_dims=None, affine_mode="full",
-                    index_hidden=16):
+                    index_hidden=16, spatial_film=False):
     set_seed(seed)
     model = UNetLiteFiLM(
         n_channels=10, index_dim=val_arrays[1].shape[1], base_filters=32,
         index_hidden=index_hidden,
         dropout=0.1, film_layers=layers, identity_init=True, zero_pc_identity=True,
         reference_zero_dims=reference_zero_dims, affine_mode=affine_mode,
+        spatial_film=spatial_film,
     ).to(device)
     missing, unexpected = model.load_state_dict(base_weights, strict=False)
-    if unexpected or any(not key.startswith("index_encoder.") for key in missing):
+    if unexpected or any(not (key.startswith("index_encoder.") or
+                              (spatial_film and key == "spatial_coeffs")) for key in missing):
         raise RuntimeError(f"baseline transfer mismatch: {missing}, {unexpected}")
     for key, parameter in model.named_parameters():
-        parameter.requires_grad_(key.startswith("index_encoder."))
+        parameter.requires_grad_(key.startswith("index_encoder.") or
+                                 (spatial_film and key == "spatial_coeffs"))
     model.eval()
     x_val, pcs_val, y_val, valid, p90 = val_arrays
     with torch.no_grad():
@@ -67,7 +70,8 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
         raise ValueError("condition_dropout must be in [0, 1)")
     if loss_name not in ("mse", "huber1"):
         raise ValueError("loss_name must be mse or huber1")
-    optimizer = torch.optim.AdamW(model.index_encoder.parameters(), lr=2e-4,
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=2e-4,
                                   weight_decay=1e-4)
     best_acc, best_epoch, best_state = -float("inf"), 0, None
     history = []
@@ -97,7 +101,7 @@ def train_candidate(name, layers, acc_weight, base_weights, dataset, val_arrays,
                     acc_weight * (1.0 - spatial_acc(pred, target, mask)) +
                     0.1 * penalty)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.index_encoder.parameters(), 2.0)
+            torch.nn.utils.clip_grad_norm_(trainable, 2.0)
             optimizer.step()
         val_pred = predict(model, "film32_identity", x_val, pcs_val, device)
         val, _ = summary(val_pred, y_val, valid, p90)

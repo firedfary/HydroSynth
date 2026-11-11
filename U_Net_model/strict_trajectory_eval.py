@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--loss", choices=("mse", "huber1"), default="mse")
     parser.add_argument("--acc-weight", type=float, default=0.0)
     parser.add_argument("--season", action="store_true")
+    parser.add_argument("--spatial-film", action="store_true")
     args = parser.parse_args()
     try:
         layers = tuple(int(value) for value in args.film_layers.split(","))
@@ -61,6 +62,9 @@ def main():
                      "pc_scale": "training six-month-mean PC standard deviation",
                      "architecture": "zero-PC-identity FiLM, hidden 16, frozen Baseline",
                      "film_layers": list(layers),
+                     "spatial_film": args.spatial_film,
+                     "spatial_basis": "bounded latitude, longitude, and interaction"
+                     if args.spatial_film else None,
                      "loss": args.loss,
                      "acc_weight": args.acc_weight,
                      "season_features": "target-month sine and cosine" if args.season else None,
@@ -99,9 +103,15 @@ def main():
                        "seeds": {}}
         prior_trajectory = None
         if (args.condition_dropout or layers != (3, 4) or args.loss != "mse" or
-                args.season or args.acc_weight):
-            prior_trajectory = json.loads((paths.results_dir / "strict_trajectory_v1" /
+                args.season or args.acc_weight or args.spatial_film):
+            prior_name = "film_early_v1" if args.spatial_film else "strict_trajectory_v1"
+            prior_trajectory = json.loads((paths.results_dir / prior_name /
                                            "trajectory_metrics.json").read_text(encoding="utf-8"))
+            if args.spatial_film and (prior_trajectory["protocol"]["film_layers"] != list(layers) or
+                                      prior_trajectory["folds"][fold]["input_sha256"] != digest or
+                                      prior_trajectory["folds"][fold]["trajectory_sha256"] !=
+                                      hashlib.sha256(trajectory.tobytes()).hexdigest()):
+                raise ValueError(f"spatial FiLM reference differs from {fold} input or layers")
         for seed in SEEDS:
             prior_base, prior_avg6 = prior_validation(paths, fold, seed)
             model, info, val_pred = train_candidate(
@@ -111,6 +121,7 @@ def main():
                 condition_dropout=args.condition_dropout,
                 loss_name=args.loss,
                 reference_zero_dims=30 if args.season else None,
+                spatial_film=args.spatial_film,
             )
             torch.save(model.state_dict(), exp_dir / "checkpoints" / f"{fold}_s{seed}.pt")
             np.savez_compressed(exp_dir / f"{fold}_s{seed}_validation.npz",
@@ -139,7 +150,7 @@ def main():
                                           for seed in SEEDS])),
         }
         if (args.condition_dropout or layers != (3, 4) or args.loss != "mse" or
-                args.season or args.acc_weight):
+                args.season or args.acc_weight or args.spatial_film):
             fold_means[fold]["no_dropout"] = float(np.mean([
                 rows[str(seed)]["no_dropout_val_acc"] for seed in SEEDS
             ]))
@@ -174,6 +185,7 @@ def main():
                 dropout=0.1, film_layers=layers, identity_init=True,
                 zero_pc_identity=True,
                 reference_zero_dims=30 if args.season else None,
+                spatial_film=args.spatial_film,
             ).to(device)
             model.load_state_dict(torch.load(
                 exp_dir / "checkpoints" / f"{fold}_s{seed}.pt",

@@ -115,7 +115,7 @@ class UNetLiteFiLM(nn.Module):
     def __init__(self, n_channels=10, n_classes=1, index_dim=3,
                  base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
                  film_layers=None, identity_init=False, zero_pc_identity=False,
-                 reference_zero_dims=None, affine_mode="full"):
+                 reference_zero_dims=None, affine_mode="full", spatial_film=False):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -126,6 +126,7 @@ class UNetLiteFiLM(nn.Module):
         if affine_mode not in ("full", "scale", "shift"):
             raise ValueError("affine_mode must be full, scale, or shift")
         self.affine_mode = affine_mode
+        self.spatial_film = spatial_film
         if not 0 <= self.reference_zero_dims <= index_dim:
             raise ValueError("reference_zero_dims must be within index_dim")
         if not self.film_layers.issubset(range(9)):
@@ -157,6 +158,19 @@ class UNetLiteFiLM(nn.Module):
             for head in (*self.index_encoder.gammas, *self.index_encoder.betas):
                 nn.init.zeros_(head.weight)
                 nn.init.zeros_(head.bias)
+        if spatial_film:
+            self.spatial_coeffs = nn.Parameter(torch.zeros(9, 3))
+
+    def _apply_film(self, x, gamma, beta, level):
+        if not self.spatial_film:
+            return apply_film(x, gamma, beta)
+        yy = torch.linspace(-1.0, 1.0, x.shape[-2], device=x.device, dtype=x.dtype)
+        xx = torch.linspace(-1.0, 1.0, x.shape[-1], device=x.device, dtype=x.dtype)
+        lat = yy[:, None]
+        lon = xx[None, :]
+        a, b, c = self.spatial_coeffs[level].tanh()
+        spatial = 1.0 + 0.25 * (a * lat + b * lon + c * lat * lon)
+        return x * (1.0 + gamma[:, :, None, None] * spatial) + beta[:, :, None, None] * spatial
 
     def reference_indices(self, indices):
         if self.reference_zero_dims == indices.shape[1]:
@@ -184,36 +198,36 @@ class UNetLiteFiLM(nn.Module):
 
         x1 = self.inc(x)
         if 0 in self.film_layers:
-            x1 = apply_film(x1, gammas[0], betas[0])
+            x1 = self._apply_film(x1, gammas[0], betas[0], 0)
 
         x2 = self.down1(x1)
         if 1 in self.film_layers:
-            x2 = apply_film(x2, gammas[1], betas[1])
+            x2 = self._apply_film(x2, gammas[1], betas[1], 1)
 
         x3 = self.down2(x2)
         if 2 in self.film_layers:
-            x3 = apply_film(x3, gammas[2], betas[2])
+            x3 = self._apply_film(x3, gammas[2], betas[2], 2)
 
         x4 = self.down3(x3)
         if 3 in self.film_layers:
-            x4 = apply_film(x4, gammas[3], betas[3])
+            x4 = self._apply_film(x4, gammas[3], betas[3], 3)
 
         x5 = self.down4(x4)
         if 4 in self.film_layers:
-            x5 = apply_film(x5, gammas[4], betas[4])
+            x5 = self._apply_film(x5, gammas[4], betas[4], 4)
 
         x = self.up1(x5, x4)
         if 5 in self.film_layers:
-            x = apply_film(x, gammas[5], betas[5])
+            x = self._apply_film(x, gammas[5], betas[5], 5)
         x = self.up2(x, x3)
         if 6 in self.film_layers:
-            x = apply_film(x, gammas[6], betas[6])
+            x = self._apply_film(x, gammas[6], betas[6], 6)
         x = self.up3(x, x2)
         if 7 in self.film_layers:
-            x = apply_film(x, gammas[7], betas[7])
+            x = self._apply_film(x, gammas[7], betas[7], 7)
         x = self.up4(x, x1)
         if 8 in self.film_layers:
-            x = apply_film(x, gammas[8], betas[8])
+            x = self._apply_film(x, gammas[8], betas[8], 8)
         logits = self.outc(x)
         return logits
 
