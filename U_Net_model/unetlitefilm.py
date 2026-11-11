@@ -113,11 +113,15 @@ class UNetLiteFiLM(nn.Module):
     U-Net with FiLM conditioning from global indices.
     """
     def __init__(self, n_channels=10, n_classes=1, index_dim=3,
-                 base_filters=32, dropout=0.2, bilinear=True, index_hidden=64):
+                 base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
+                 film_layers=None, identity_init=False):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        self.film_layers = frozenset(range(5) if film_layers is None else film_layers)
+        if not self.film_layers.issubset(range(5)):
+            raise ValueError("film_layers must contain encoder levels 0 through 4")
 
         # Encoder
         self.inc = DoubleConv(n_channels, base_filters, dropout=dropout)
@@ -138,28 +142,40 @@ class UNetLiteFiLM(nn.Module):
         feature_dims = [base_filters, base_filters*2, base_filters*4,
                         base_filters*8, base_filters*16 // factor]
         self.index_encoder = IndexEncoder(index_dim, index_hidden, feature_dims)
+        if identity_init:
+            for head in (*self.index_encoder.gammas, *self.index_encoder.betas):
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
 
-    def forward(self, x, indices):
+    def forward(self, x, indices, film_gain=1.0):
         """
         x: [B,C,H,W]   (local climate fields)
         indices: [B,K] (global indices)
         """
         gammas, betas = self.index_encoder(indices)
+        if film_gain != 1.0:
+            gammas = [gamma * film_gain for gamma in gammas]
+            betas = [beta * film_gain for beta in betas]
 
         x1 = self.inc(x)
-        x1 = apply_film(x1, gammas[0], betas[0])
+        if 0 in self.film_layers:
+            x1 = apply_film(x1, gammas[0], betas[0])
 
         x2 = self.down1(x1)
-        x2 = apply_film(x2, gammas[1], betas[1])
+        if 1 in self.film_layers:
+            x2 = apply_film(x2, gammas[1], betas[1])
 
         x3 = self.down2(x2)
-        x3 = apply_film(x3, gammas[2], betas[2])
+        if 2 in self.film_layers:
+            x3 = apply_film(x3, gammas[2], betas[2])
 
         x4 = self.down3(x3)
-        x4 = apply_film(x4, gammas[3], betas[3])
+        if 3 in self.film_layers:
+            x4 = apply_film(x4, gammas[3], betas[3])
 
         x5 = self.down4(x4)
-        x5 = apply_film(x5, gammas[4], betas[4])
+        if 4 in self.film_layers:
+            x5 = apply_film(x5, gammas[4], betas[4])
 
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
