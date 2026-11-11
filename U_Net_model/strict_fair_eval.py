@@ -28,11 +28,11 @@ MODELS = ("baseline32", "eof_cat32", "film16_original", "film32_identity")
 METRICS = ("mean_acc", "mean_tcc", "rmse", "sc_pct", "csi", "sig_pct")
 
 
-def make_model(name, dropout):
+def make_model(name, dropout, index_dim=5):
     if name == "baseline32":
         return UNetLite(n_channels=10, base_filters=32, dropout=dropout)
     if name == "eof_cat32":
-        return UNetLite(n_channels=15, base_filters=32, dropout=dropout)
+        return UNetLite(n_channels=10 + index_dim, base_filters=32, dropout=dropout)
     return UNetLiteFiLM(
         n_channels=10, index_dim=5,
         base_filters=16 if name == "film16_original" else 32,
@@ -59,9 +59,9 @@ def predict(model, name, x, pcs, device):
     return np.concatenate(outputs)
 
 
-def train(name, train_ds, val_ds, device, epochs, lr, dropout, seed):
+def train(name, train_ds, val_ds, device, epochs, lr, dropout, seed, index_dim=5):
     set_seed(seed)
-    model = make_model(name, dropout).to(device)
+    model = make_model(name, dropout, index_dim=index_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, drop_last=True)
