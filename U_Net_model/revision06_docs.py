@@ -26,6 +26,7 @@ ABLATION = json.loads((RESULTS / "revision06_ablation_v1/ablation.json").read_te
 ENSO = json.loads((RESULTS / "revision06_eval_v2/enso_metrics.json").read_text(encoding="utf-8"))
 ROLLING = json.loads((RESULTS / "revision06_rolling_v1/metrics.json").read_text(encoding="utf-8"))
 INFERENCE = json.loads((RESULTS / "revision06_inference_v1/inference.json").read_text(encoding="utf-8"))
+REGIONAL = json.loads((RESULTS / "revision06_regions_v1/regional_metrics.json").read_text(encoding="utf-8"))["rows"]
 if "ensemble" not in ROLLING:
     raise RuntimeError("Rolling holdout has not finished")
 
@@ -167,6 +168,7 @@ def manuscript():
         "4 College of Physical Science and Technology, Yangzhou University, Yangzhou 225009, China",
     ):
         para(doc, line)
+    para(doc, "* Corresponding author: Xiaojuan WANG; email: mouse0903@126.com")
     heading(doc, "Abstract")
     test = METRICS["test"]["ensemble"]
     para(doc, "Study Region: Mainland China, where monsoon variability, aridity, and complex terrain challenge monthly precipitation prediction.")
@@ -183,8 +185,8 @@ def manuscript():
 
     heading(doc, "2 Data and methods")
     heading(doc, "2.1 Data and chronology", 2)
-    para(doc, "Monthly SEAS5 archive files from January 1994 through September 2024 supply ten China-domain atmospheric fields: total precipitation (tp), geopotential height at 200 and 500 hPa (h200, h500), sea-level pressure (slp), 2-m temperature (t2m), 850-hPa temperature (t850), and zonal and meridional winds at 200 and 850 hPa (u200, u850, v200, v850). The archived 1° fields are bilinearly mapped to a 120 × 140 grid spanning 70–140°E and 0–60°N. Precipitation observations are based on 2,374 National Meteorological Information Center stations and their prepared gridded target field; 5,243 land cells contain valid observations across the analysis. Global NOAA Extended Reconstructed Sea Surface Temperature version 5 (ERSSTv5) fields provide SST predictors (Huang et al., 2017). Three archive months are absent (September and October 2011; January 2017), leaving 366 aligned months.")
-    para(doc, "The main chronology assigns 285 months in 1994–2017 to fitting, 60 months in 2018–2022 to validation and checkpoint selection, and 21 months in January 2023–September 2024 to exploratory evaluation. All data-dependent atmospheric normalization, SST climatology, EOF basis, and score scaling are fitted on the first period. The observed and raw SEAS5 precipitation anomalies use a fixed 1994–2010 calendar-month reference climatology, which lies within training. Their fractional anomaly is precipitation minus the corresponding calendar-month mean, divided by that mean plus 0.0001. For the SEAS5 comparator, we select the first monthly tp field from each target-month archive file, bilinearly interpolate it, and constrain it nonnegative before anomaly conversion. The file metadata identify the first valid month but do not establish an operational initialization date or lead label. No standardized network input is used as the raw comparator.")
+    para(doc, "Monthly SEAS5 archive files supplied by the National Climate Center of China from January 1994 through September 2024 supply ten China-domain atmospheric fields: total precipitation (tp), geopotential height at 200 and 500 hPa (h200, h500), sea-level pressure (slp), 2-m temperature (t2m), 850-hPa temperature (t850), and zonal and meridional winds at 200 and 850 hPa (u200, u850, v200, v850). The archived 1° fields are mapped to a nominal 0.5° grid of 120 × 140 cells over 70–140°E and 0–60°N; network predictors use bicubic interpolation, while the raw-precipitation comparator uses bilinear interpolation. Precipitation observations are based on 2,374 National Meteorological Information Center stations and their prepared gridded target field; 5,243 land cells contain valid observations across the analysis. Global NOAA Extended Reconstructed Sea Surface Temperature version 5 (ERSSTv5) fields provide SST predictors (Huang et al., 2017). Three archive months are absent (September and October 2011; January 2017), leaving 366 aligned months.")
+    para(doc, "The main chronology assigns 285 months in 1994–2017 to fitting, 60 months in 2018–2022 to validation and checkpoint selection, and 21 months in January 2023–September 2024 to exploratory evaluation. All data-dependent atmospheric normalization, SST climatology, EOF basis, and score scaling are fitted on the first period. The observed and raw SEAS5 precipitation anomalies use a fixed 1994–2010 calendar-month reference climatology, which lies within training. Their fractional anomaly is precipitation minus the corresponding calendar-month mean, divided by that mean plus 0.0001. For the SEAS5 comparator, we select the first monthly tp field from each target-month archive file, bilinearly interpolate it, constrain it nonnegative, and apply a fixed 31-day conversion factor before anomaly conversion, matching the archived-data processing. The file metadata identify the first valid month but do not establish an operational initialization date or lead label. No standardized network input is used as the raw comparator.")
     para(doc, "The target's extreme anomalies are retained without winsorization. The 90th percentile of training anomalies, 0.9843, defines extreme hits. This fractional-anomaly scale can magnify small absolute precipitation errors where climatological rainfall is low, so both aggregate skill and regional maps require caution. A 2020–2021 retrospective holdout uses a separate fitting origin (1994–2015 training, 2016–2019 validation) with all transforms and models refitted. That period was previously inspected and is a sensitivity check, not a pristine new test.")
     heading(doc, "2.2 SST representation and model comparison", 2)
     para(doc, "The stored SST predictor contains six preceding monthly fields for each target month. We average those six fields to one SST map, subtract a training-only SST climatology, fit EOFs on the training maps, and project later maps onto the frozen basis. The first five standardized principal-component (PC) scores are shared by EOF-cat and FiLM. Averaging removes within-window timing; the design should not be described as a six-step PC sequence or a one-month PC lag.")
@@ -226,10 +228,20 @@ def manuscript():
     figure(doc, "Fig3_temporal_corr.png", "Figure 3. Gridwise TCC for all four systems over 21 months. Dots indicate nominal two-sided p < 0.05 at displayed cells; they are not a spatial field-significance mask.")
     figure(doc, "Fig4_TCC_difference.png", "Figure 4. Gridwise FiLM-minus-baseline and FiLM-minus-EOF-cat TCC differences over 21 exploratory months. These maps are descriptive and carry no spatial significance claim.")
     figure(doc, "Fig5_spatial_examples.png", "Figure 5. Observed and predicted fractional precipitation anomalies in January, April, July, and October 2023. The same display range is used for every panel; values beyond it are clipped for visualization only.", 6.5)
-    para(doc, "The example maps reveal common smoothing and regional differences across the monsoon domain, Tibetan Plateau, and arid northwest. The strong dependence of skill on raw forecast precipitation, and the fractional target's sensitivity to low-rainfall climatology, are plausible contributors; these maps alone cannot identify a specific atmospheric mechanism or establish a regional causal attribution.")
+    regional_rows = []
+    for period, label in (("validation", "2018–22"), ("test", "2023–24")):
+        for region in ("East", "Southwest", "Northwest"):
+            group = {row["model"]: row for row in REGIONAL
+                     if row["period"] == period and row["region"] == region}
+            regional_rows.append((label, region, group["seas5"]["valid_cells"],
+                                  *(f(group[model]["acc"]) for model in
+                                    ("seas5", "baseline", "eof_cat", "film"))))
+    para(doc, "Table 4. Descriptive regional spatial ACC on the common valid grid. East is ≥105°E; Southwest is <105°E and ≤37°N; Northwest is <105°E and >37°N. These simple geographic partitions are not formal hydroclimatic zones. Within-region ACC is computed across that region's cells for each month, then averaged; it need not average to the nationwide ACC.")
+    table(doc, ("Period", "Region", "Cells", "SEAS5", "Baseline", "EOF-cat", "FiLM"), regional_rows)
+    para(doc, "In the explored period, baseline ACC exceeds raw SEAS5 in each partition: 0.369 versus 0.354 in the east, 0.284 versus 0.254 in the southwest, and 0.325 versus 0.299 in the northwest. EOF-cat trails raw SEAS5 in all three, while FiLM is only slightly above it. The southwest has the lowest regional ACC for every system. These partitions were inspected after model development and have no regional significance test. Terrain, station coverage, and amplified fractional anomalies in dry areas are possible explanations, not demonstrated causes.")
     heading(doc, "3.3 Conditioning controls and predictor importance", 2)
     ab = ABLATION["ensemble"]
-    para(doc, "Table 4. Symmetric input controls on the exploratory period. PC zeroing and local-input zeroing are out-of-distribution perturbations, so their score changes diagnose dependence but are not replacement-model benchmarks.")
+    para(doc, "Table 5. Symmetric input controls on the exploratory period. PC zeroing and local-input zeroing are out-of-distribution perturbations, so their score changes diagnose dependence but are not replacement-model benchmarks.")
     table(doc, ("Input condition", "Baseline ACC", "EOF-cat ACC", "FiLM ACC"),
           [(label, f(ab[key]["baseline"]["mean_acc"]),
             f(ab[key]["eof_cat"]["mean_acc"]), f(ab[key]["film"]["mean_acc"]))
@@ -240,7 +252,7 @@ def manuscript():
     para(doc, "Replacing one atmospheric predictor map at a time with a same-calendar-month map from the validation period makes tp dominant: its FiLM ACC reduction averages 0.263 across ten trials. Every other predictor has an absolute mean effect below 0.005. Correlated circulation variables can substitute for one another, so a small single-variable permutation effect does not prove that the variable is useless. The test-period use of these controls remains exploratory.")
     figure(doc, "Fig7_predictor_importance.png", "Figure 7. FiLM predictor permutation importance, measured as mean decrease in spatial ACC when one full atmospheric map is replaced.", 5.8)
     heading(doc, "3.4 ENSO phase and retrospective origin", 2)
-    para(doc, "We classify each month using the NOAA Climate Prediction Center historical Oceanic Niño Index (ONI) centered three-month value: warm at ≥ +0.5 °C, cold at ≤ −0.5 °C, and neutral otherwise. These threshold categories are not declarations of official ENSO episodes. In 2023–2024 there are 13 warm, one cold, and seven neutral months. The single cold month does not permit a temporal correlation estimate, and no phase-specific score from that period is a stable regime generalization. Tables 5 and 6 report the 2018–2022 validation period and explored period. We do not use 1994–2017 training predictions as evidence of out-of-sample phase skill: the networks were fitted on those same target months. The refitted 2020–2021 holdout provides a separate, previously inspected sensitivity check rich in cold-phase months.")
+    para(doc, "We classify each month using the NOAA Climate Prediction Center historical Oceanic Niño Index (ONI) centered three-month value: warm at ≥ +0.5 °C, cold at ≤ −0.5 °C, and neutral otherwise. These threshold categories are not declarations of official ENSO episodes. In 2023–2024 there are 13 warm, one cold, and seven neutral months. The single cold month does not permit a temporal correlation estimate, and no phase-specific score from that period is a stable regime generalization. Tables 6 and 7 report the 2018–2022 validation period and explored period. We do not use 1994–2017 training predictions as evidence of out-of-sample phase skill: the networks were fitted on those same target months. The refitted 2020–2021 holdout provides a separate, previously inspected sensitivity check rich in cold-phase months.")
     rows = []
     for period, key in (("2018–2022 validation", "validation"),
                         ("2023–2024 explored", "test")):
@@ -249,7 +261,7 @@ def manuscript():
             rows.append((period, phase, row["months"],
                          *[f(row["metrics"][name]["mean_acc"]) for name in
                            ("seas5", "baseline", "eof_cat", "film")]))
-    para(doc, "Table 5. Spatial ACC by ONI threshold category. The exploratory cold category contains only one month.")
+    para(doc, "Table 6. Spatial ACC by ONI threshold category. The exploratory cold category contains only one month.")
     table(doc, ("Period", "ONI", "n", "SEAS5", "Baseline", "EOF-cat", "FiLM"), rows)
     tcc_rows = []
     for period, key in (("2018–2022 validation", "validation"),
@@ -259,10 +271,10 @@ def manuscript():
             tcc_rows.append((period, phase, row["months"],
                              *[f(row["metrics"][name]["mean_tcc"]) for name in
                                ("seas5", "baseline", "eof_cat", "film")]))
-    para(doc, "Table 6. Spatially averaged TCC within ONI threshold categories. The seven-month neutral estimate is unstable; TCC is omitted for one cold month.")
+    para(doc, "Table 7. Spatially averaged TCC within ONI threshold categories. The seven-month neutral estimate is unstable; TCC is omitted for one cold month.")
     table(doc, ("Period", "ONI", "n", "SEAS5", "Baseline", "EOF-cat", "FiLM"), tcc_rows)
     hold = ROLLING["ensemble"]["holdout"]
-    caption = para(doc, "Table 7. Retrospective 2020–2021 holdout after refitting training-only transforms and all three models from the earlier origin. This window was previously inspected and is not a new confirmatory test.")
+    caption = para(doc, "Table 8. Retrospective 2020–2021 holdout after refitting training-only transforms and all three models from the earlier origin. This window was previously inspected and is not a new confirmatory test.")
     caption.paragraph_format.page_break_before = True
     caption.paragraph_format.keep_with_next = True
     table(doc, ("Model", "ACC", "TCC", "RMSE", "Sign %", "CSI"),
@@ -280,7 +292,7 @@ def manuscript():
     heading(doc, "5 Conclusions")
     para(doc, "Under training-fitted preprocessing and a physically reconstructed SEAS5 comparator, the three U-Net postprocessors show different metric trade-offs. Baseline has the best spatial ACC and sign consistency in the explored 2023–2024 period; EOF-cat has the best mean TCC, RMSE, and extreme CSI; FiLM is not consistently best and does not show a stable ACC benefit from simultaneous SST scores. All three improve RMSE and CSI in this period, but EOF-cat loses ACC relative to SEAS5 and none supports a universal superiority claim. The 2020–2021 retrained origin and short-period uncertainty further bound generalization. This comparison establishes a reproducible evaluation and identifies the conditions that any claimed FiLM advantage must withstand in a future independent test.")
     heading(doc, "Data and code availability")
-    para(doc, "Analysis scripts, aggregate metrics, and derived figures are retained with the revision materials and can be provided by the corresponding author. Raw SEAS5, ERSST, and station observations remain subject to their providers' access conditions. The 2025 forecast–observation pairs needed for a new untouched final test were unavailable for this revision.")
+    para(doc, "Analysis scripts, aggregate metrics, and derived figures are retained with the revision materials and can be provided by the corresponding author. The SEAS5 archive was supplied by the National Climate Center of China; raw SEAS5, ERSST, and station observations remain subject to their providers' access conditions. The 2025 forecast–observation pairs needed for a new untouched final test were unavailable for this revision.")
     heading(doc, "Funding")
     para(doc, "This work was supported by the National Natural Science Foundation of China (grant numbers 42275050, 42130610, and 42575056).")
     heading(doc, "Declaration of generative AI and AI-assisted technologies in the writing process")
@@ -310,19 +322,19 @@ ISSUES = [
     ("R1 Major 3", "ACC magnitude and additional metrics", "Table 1 reports ACC, TCC, RMSE, sign consistency, and extreme CSI. Table 2 reports paired monthly differences, Wilcoxon p-values, and two bootstrap intervals. FiLM minus SEAS5 ACC is +0.0028 (p = 0.892), and no robust FiLM ACC gain is claimed."),
     ("R1 Major 4", "U-Net and FiLM increments", "Baseline, EOF-cat, FiLM, and raw SEAS5 appear in Tables 1–2 and Figures 1–4. The explored-period baseline ACC is 0.333, FiLM 0.316, and EOF-cat 0.293. The revised conclusion attributes no incremental ACC benefit to FiLM."),
     ("R1 Major 5", "Ten predictor channels", "Section 3.3 and Figure 7 report matched-calendar-month, channelwise perturbations. Replacing tp lowers FiLM ACC by 0.263 on average; every other individual variable has an absolute effect below 0.005. Collinearity limits a necessity interpretation."),
-    ("R1 Major 6", "Regional differences", "Figure 5 includes all methods for the same months with a common color range. Section 3.2 discusses heterogeneous regional error and identifies terrain, station coverage, and fractional-anomaly scaling as plausible explanations, without presenting these as causal findings."),
+    ("R1 Major 6", "Regional differences", "Figure 5 includes all methods for the same months with a common color range. New Table 4 reports spatial ACC for three nonoverlapping geographic partitions in both validation and explored periods. In the latter, baseline exceeds raw SEAS5 in each partition, EOF-cat trails it in each, and FiLM is only slightly above it. Southwest ACC is lowest for every system. The partitions are descriptive and post hoc; terrain, station coverage, and fractional-anomaly scaling remain hypotheses rather than demonstrated causes."),
     ("R1 Minor 1", "Abbreviations", "The revised introduction and methods define SST, EOF, PC, FiLM, ACC, TCC, RMSE, CSI, and ONI at first use. Unused BCC-CSM and PDO references were removed from the main argument."),
     ("R1 Minor 2", "Spacing and sentences", "The paper was reset as a new manuscript with complete prose descriptions of domain, period, and resolution. Captions and text were proofread for citation spacing and punctuation."),
     ("R1 Minor 3", "Predictor count", "Section 2.1 lists exactly ten fields: tp, h200, h500, slp, t2m, t850, u200, u850, v200, and v850."),
     ("R1 Minor 4", "Figure colors and legends", "Figures 1–2 were regenerated with distinguishable series and unobstructed legends; the direct monthly comparison now includes all four systems."),
     ("R1 Minor 5", "Spatial example labels and scale", "Figure 5 has direct month and method labels, including observation and all three neural models, and a shared display scale for corresponding panels."),
     ("R1 Minor 6", "EOF-cat label", "The first mention defines EOF-cat as input-channel concatenation of five EOF principal-component scores."),
-    ("R2 1", "Short period, ENSO, and another origin", "We agree that 21 months cannot support interannual claims. Section 3.4 and Tables 5–6 use NOAA CPC ONI rather than SST PC1 as a phase proxy. The 2018–2022 validation period contains 15 warm, 28 cold, and 17 neutral threshold months, with ACC and TCC reported for all four methods. The explored period has 13 warm, one cold, and seven neutral months. We do not treat 1994–2017 training predictions as out-of-sample phase skill. The retrained 2020–2021 holdout has three warm, thirteen cold, and eight neutral months and is reported in Table 7. Both evaluation periods were previously inspected; the single exploratory cold month has no TCC estimate."),
+    ("R2 1", "Short period, ENSO, and another origin", "We agree that 21 months cannot support interannual claims. Section 3.4 and Tables 6–7 use NOAA CPC ONI rather than SST PC1 as a phase proxy. The 2018–2022 validation period contains 15 warm, 28 cold, and 17 neutral threshold months, with ACC and TCC reported for all four methods. The explored period has 13 warm, one cold, and seven neutral months. We do not treat 1994–2017 training predictions as out-of-sample phase skill. The retrained 2020–2021 holdout has three warm, thirteen cold, and eight neutral months and is reported in Table 8. Both evaluation periods were previously inspected; the single exploratory cold month has no TCC estimate."),
     ("R2 2", "Preprocessing leakage", "The current analysis rebuilds all atmospheric normalization and SST climatology, EOF basis, and score scaling from 1994–2017 training only; the raw SEAS5 comparator uses its physical precipitation field and fixed 1994–2010 monthly reference. For the 2020–2021 origin, transforms are refitted on 1994–2015. The older numbers based on full-series normalization are withdrawn."),
     ("R2 3", "Missing direct comparisons", "Figure 1 now plots the monthly FiLM-minus-baseline, FiLM-minus-EOF-cat, and FiLM-minus-SEAS5 ACC differences; the 2023 annual differences are -0.015, +0.015, and +0.025, respectively, versus -0.017, +0.034, and -0.026 in 2024. Figure 4 maps FiLM-minus-baseline and FiLM-minus-EOF-cat TCC on the same grid. Figure 5 shows all four systems for the same months and display range. Tables 1–3 quantify the direct comparisons. FiLM has no general advantage over baseline."),
     ("R2 4", "EOF-cat fairness and degradation", "The current comparison gives both SST models the same five scores from a six-month SST average, the same 32-channel backbone width, learning rate, dropout, epochs, seed set, and validation ACC checkpoint rule. EOF-cat broadcasts scores at the input whereas FiLM modulates five encoder depths, so insertion depth and added parameters are not equivalent. Its explored ACC loss is described, and the SST-zero control raises EOF-cat ACC from 0.293 to 0.319; we do not ascribe the loss uniquely to redundant representation."),
     ("R2 5", "Paired inference and TCC mask", "Table 2 gives paired monthly ACC differences, Wilcoxon p-values, and month and year-block bootstrap intervals. Table 3 adds paired spatial-mean TCC differences and year-block resampling: in 2018–2022, FiLM-minus-baseline is -0.010 (95% interval [-0.017, 0.002]) and FiLM-minus-EOF-cat is +0.004 ([-0.003, 0.026]). The 2023–2024 TCC block ranges have only three distinct combinations, so we report them descriptively rather than as confidence intervals. Figure 3 stippling denotes nominal gridwise p < 0.05, not field significance; Figure 4 maps the two direct TCC differences. No significant FiLM superiority is claimed."),
-    ("R2 6", "Symmetric ablation and negative control", "Table 4 and Figure 6 evaluate full input, zeroed SST scores, and zeroed atmospheric maps for baseline, EOF-cat, and FiLM. Same-calendar-month SST-score replacement is also reported. FiLM ACC rises from 0.316 to 0.318 with zeros and 0.324 under replacement; therefore, SST-driven FiLM parameters are not presented as evidence of improved teleconnection skill."),
+    ("R2 6", "Symmetric ablation and negative control", "Table 5 and Figure 6 evaluate full input, zeroed SST scores, and zeroed atmospheric maps for baseline, EOF-cat, and FiLM. Same-calendar-month SST-score replacement is also reported. FiLM ACC rises from 0.316 to 0.318 with zeros and 0.324 under replacement; therefore, SST-driven FiLM parameters are not presented as evidence of improved teleconnection skill."),
 ]
 
 CN_ISSUES = [
@@ -334,19 +346,19 @@ CN_ISSUES = [
     ("审稿人 1 主要 3", "ACC 幅度与其他指标", "表 1 同时报告 ACC、TCC、RMSE、符号一致率及极端 CSI；表 2 报告月度配对差、Wilcoxon p 值和两种 bootstrap 区间。FiLM 相对 SEAS5 的 ACC 仅高 0.0028，p=0.892，不作为稳健增益。"),
     ("审稿人 1 主要 4", "U-Net 与 FiLM 增量", "表 1—2 和图 1—4 直接展示 Baseline、EOF-cat、FiLM 与原始 SEAS5。探索期 ACC 分别为 0.333、0.293、0.316、0.314；没有将 FiLM 描述为相对基线的正增量。"),
     ("审稿人 1 主要 5", "十个大气变量", "图 7 给出同历月整幅变量场替换的重要性。tp 平均使 FiLM ACC 降低 0.263，其他变量各自绝对变化小于 0.005；相关变量之间可能互相替代，因此不据此判定变量无用。"),
-    ("审稿人 1 主要 6", "区域差异", "图 5 将四种模型置于同一月份和同一色标；正文讨论地形、观测站分布和少雨区比例异常的可能作用，并明确其属于解释性假说。"),
+    ("审稿人 1 主要 6", "区域差异", "图 5 将四种模型置于同一月份和同一色标；新增表 4，分别报告验证期与探索期三个互不重叠地理分区的区域 ACC。探索期 Baseline 在三个区均高于原始 SEAS5，EOF-cat 在三个区均低于原始 SEAS5，FiLM 仅略高；西南区四系统 ACC 均最低。分区分析属于事后描述，地形、观测站分布和少雨区比例异常仅为待检验解释。"),
     ("审稿人 1 次要 1", "缩写", "正文首次出现时解释 SST、EOF、PC、FiLM、ACC、TCC、RMSE、CSI、ONI；未使用的 BCC-CSM 和 PDO 表述已移除。"),
     ("审稿人 1 次要 2", "空格和完整句", "新稿统一重排，研究区域、时间和分辨率均改为完整句，并核对引文、标点与图注。"),
     ("审稿人 1 次要 3", "变量数量", "方法部分明确列出 tp、h200、h500、slp、t2m、t850、u200、u850、v200、v850 共十项。"),
     ("审稿人 1 次要 4", "颜色和图例", "重新绘制月度 ACC 和指标对照图，四系统采用可区分配色，图例不遮挡数据。"),
     ("审稿人 1 次要 5", "空间图标签", "图 5 直接标注月份、观测、SEAS5 和三种神经网络方法，各对应面板采用相同显示范围。"),
     ("审稿人 1 次要 6", "EOF-cat 定义", "首次出现时将 EOF-cat 定义为五个 EOF 主成分得分在输入通道拼接。"),
-    ("审稿人 2 第 1 点", "短时段、ENSO 和另一训练起点", "承认 21 个月不足以支持年际泛化。表 5—6 改用 NOAA CPC ONI 分组：2018—2022 年验证期含暖相 15、冷相 28、中性 17 个月，报告四种方法的 ACC 与 TCC；探索期为 13、1、7 个月。1994—2017 年是网络拟合期，不能把该期训练预测当作样本外位相技巧。表 7 报告重训 2020—2021 年留出期，含暖相 3、冷相 13、中性 8 个月。两个评估期均曾被查看，单个探索期冷相月不计算 TCC。"),
+    ("审稿人 2 第 1 点", "短时段、ENSO 和另一训练起点", "承认 21 个月不足以支持年际泛化。表 6—7 改用 NOAA CPC ONI 分组：2018—2022 年验证期含暖相 15、冷相 28、中性 17 个月，报告四种方法的 ACC 与 TCC；探索期为 13、1、7 个月。1994—2017 年是网络拟合期，不能把该期训练预测当作样本外位相技巧。表 8 报告重训 2020—2021 年留出期，含暖相 3、冷相 13、中性 8 个月。两个评估期均曾被查看，单个探索期冷相月不计算 TCC。"),
     ("审稿人 2 第 2 点", "预处理泄露", "大气变量归一化及 SST 气候态、EOF 基底和主成分标准化仅在 1994—2017 年训练数据拟合；原始 SEAS5 降水使用物理量及 1994—2010 年固定月气候态。2020—2021 年试验重新在 1994—2015 年拟合。撤回全时段归一化所得旧数值。"),
     ("审稿人 2 第 3 点", "完整直接对照", "图 1 直接画出 FiLM 相对 Baseline、EOF-cat、SEAS5 的逐月 ACC 差；2023 年三者年均差分别为 -0.015、+0.015、+0.025，2024 年分别为 -0.017、+0.034、-0.026。图 4 显示 FiLM 相对 Baseline 和 EOF-cat 的逐格 TCC 差，图 5 对齐四种方法的相同月份及色标；表 1—3 给出整体、配对及 TCC 统计。"),
     ("审稿人 2 第 4 点", "EOF-cat 公平性与退化", "两种 SST 模型共享由六个月 SST 均值得出的五个得分，主干均为 32 通道，学习率、dropout、训练轮数、随机种子及验证 ACC 选模规则相同。但 EOF-cat 在输入层拼接，FiLM 调制五层，深度和新增参数仍不等同。EOF-cat 的 SST 置零 ACC 由 0.293 升至 0.319，不能简单归因于冗余表示。"),
     ("审稿人 2 第 5 点", "配对推断与 TCC 显著性", "表 2 给出月度 ACC 配对检验及逐月、按年分块区间。表 3 补充空间平均 TCC 的配对年分块结果：2018—2022 年 FiLM 减 Baseline 为 -0.010，95% 区间 [-0.017, 0.002]；FiLM 减 EOF-cat 为 +0.004，区间 [-0.003, 0.026]。2023—2024 年仅有三种不同的两年分块组合，因此只报告描述性范围，不声称显著。图 3 点标仅代表逐格名义 p<0.05，图 4 展示两组直接 TCC 差值；已删除显著优于对照的表述。"),
-    ("审稿人 2 第 6 点", "对称消融和阴性对照", "表 4、图 6 对 Baseline、EOF-cat、FiLM 同时进行完整输入、SST 得分置零和局地大气输入置零，并补充同历月 SST 得分替换。FiLM ACC 分别为 0.316、0.318 和替换后的 0.324，不将调制参数相关性解释成预报能力提升的证据。"),
+    ("审稿人 2 第 6 点", "对称消融和阴性对照", "表 5、图 6 对 Baseline、EOF-cat、FiLM 同时进行完整输入、SST 得分置零和局地大气输入置零，并补充同历月 SST 得分替换。FiLM ACC 分别为 0.316、0.318 和替换后的 0.324，不将调制参数相关性解释成预报能力提升的证据。"),
 ]
 
 
