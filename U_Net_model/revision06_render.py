@@ -15,7 +15,8 @@ from utils.paths import SubprojectPaths
 DELIVERY = (Path.home() / "OneDrive/Desktop/文献与汇报/02_自研课题与论文/"
             "FiLM调制UNet降水预测/修改1/06_对照研究返修")
 OUTPUT = SubprojectPaths(__file__).results_dir / "revision06_docs_qa"
-NAMES = ("06_对照研究稿", "06_Response_EN", "06_审稿回复中文", "Highlights")
+NAMES = ("06_对照研究稿", "06_Response_EN", "06_审稿回复中文",
+         "Highlights", "06_Supplement_S1")
 
 
 def main():
