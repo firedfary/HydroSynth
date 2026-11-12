@@ -81,17 +81,18 @@ def main():
                      color=COLOR[name], label=LABEL[name])
     axes[0].axhline(0, color="#999999", lw=0.8)
     axes[0].set_ylabel("Monthly spatial ACC")
-    axes[0].legend(ncol=4, loc="lower center", bbox_to_anchor=(0.5, 1.02), frameon=False)
+    axes[0].legend(ncol=4, loc="lower center", bbox_to_anchor=(0.5, 1.14), frameon=False)
     axes[0].set_title("(a) Monthly spatial anomaly correlation", loc="left", fontsize=11)
-    for name in ("baseline", "eof_cat", "film"):
-        axes[1].plot(x, series[name] - series["seas5"], marker="o", ms=3,
-                     lw=1.4, color=COLOR[name], label=LABEL[name])
+    for name in ("baseline", "eof_cat", "seas5"):
+        axes[1].plot(x, series["film"] - series[name], marker="o", ms=3,
+                     lw=1.4, color=COLOR[name], label=f"FiLM - {LABEL[name]}")
     axes[1].axhline(0, color="#555555", lw=0.9)
-    axes[1].set_ylabel("ACC difference vs SEAS5")
+    axes[1].set_ylabel("FiLM ACC difference")
     axes[1].set_title("(b) Paired monthly differences", loc="left", fontsize=11)
+    axes[1].legend(ncol=3, loc="lower center", bbox_to_anchor=(0.5, 1.14), frameon=False)
     axes[1].set_xticks(x[::2], [str(v) for v in dates[::2]], rotation=45, ha="right")
     fig.tight_layout()
-    save(fig, "Fig2_monthly_ACC", figures, delivery)
+    save(fig, "Fig1_monthly_ACC", figures, delivery)
 
     keys = ("mean_acc", "mean_tcc", "rmse", "sc_pct", "csi")
     names = ("Spatial ACC", "Mean TCC", "RMSE", "Sign consistency (%)", "Extreme CSI")
@@ -110,7 +111,7 @@ def main():
         ax.set_ylim(0, max(values) + max(span * 0.35, 0.05))
     axes.flat[5].axis("off")
     fig.suptitle("Evaluation period: January 2023-September 2024 (21 months)")
-    save(fig, "Fig3_metric_tradeoff", figures, delivery)
+    save(fig, "Fig2_metric_tradeoff", figures, delivery)
 
     tcc = {}
     pval = {}
@@ -132,7 +133,7 @@ def main():
     fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.72,
                  location="bottom", label="Temporal correlation")
     fig.suptitle("Gridwise temporal correlation (21 months; descriptive)")
-    save(fig, "Fig4_temporal_corr", figures, delivery)
+    save(fig, "Fig3_temporal_corr", figures, delivery)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.3), sharex=True, sharey=True,
                              constrained_layout=True)
@@ -148,7 +149,7 @@ def main():
         ax.set_ylabel("Latitude (degrees N)")
     fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.7,
                  location="bottom", label="TCC difference")
-    save(fig, "FigS2_TCC_difference", figures, delivery)
+    save(fig, "Fig4_TCC_difference", figures, delivery)
 
     representative = ("2023-01", "2023-04", "2023-07", "2023-10")
     fields = (("Observation", obs),) + tuple((LABEL[name], test[name]) for name in ORDER)
@@ -179,22 +180,23 @@ def main():
         values = {
             name: [ablation["ensemble"][case][name]["mean_acc"]
                    for case in ("full", "pc_zero", "local_zero")]
-            for name in ("eof_cat", "film")
+            for name in ("baseline", "eof_cat", "film")
         }
+        values["baseline"].append(values["baseline"][0])
         values["eof_cat"].append(ablation["pc_shuffle"]["eof_cat"]["mean_acc"])
         values["film"].append(ablation["pc_shuffle"]["film"]["mean_acc"])
         fig, ax = plt.subplots(figsize=(8.5, 4.8))
         xloc = np.arange(4)
-        width = 0.35
-        for offset, name in ((-width / 2, "eof_cat"), (width / 2, "film")):
+        width = 0.25
+        for offset, name in ((-width, "baseline"), (0, "eof_cat"), (width, "film")):
             ax.bar(xloc + offset, values[name], width, label=LABEL[name], color=COLOR[name])
         ax.set_xticks(xloc, ("Full input", "SST PCs zeroed", "Local fields zeroed",
                               "SST PCs replaced"))
         ax.set_ylabel("Test spatial ACC")
         ax.set_ylim(-0.06, 0.39)
         ax.axhline(0, color="#777777", lw=0.8)
-        ax.legend(frameon=False)
-        ax.set_title("Symmetric input ablations (three-seed ensembles)")
+        ax.legend(frameon=False, ncol=3, loc="lower center",
+                  bbox_to_anchor=(0.5, 1.01))
         fig.tight_layout()
         save(fig, "Fig6_symmetric_ablation", figures, delivery)
 
