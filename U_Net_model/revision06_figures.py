@@ -5,12 +5,18 @@ import csv
 import json
 import shutil
 import sys
+from functools import lru_cache
 from pathlib import Path
 
+import cartopy.crs as ccrs
+from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
+import shapefile
+from shapely.geometry import LineString, shape
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -18,12 +24,118 @@ if str(ROOT) not in sys.path:
 
 from utils.paths import SubprojectPaths
 from run_unified_eval import compute_tcc_and_p
+from utils import maskout
 from utils.utils import cal_acc
 
 
 ORDER = ("seas5", "baseline", "eof_cat", "film")
 LABEL = {"seas5": "SEAS5", "baseline": "U-Net", "eof_cat": "EOF-cat", "film": "FiLM-U-Net"}
 COLOR = {"seas5": "#525C66", "baseline": "#126A8A", "eof_cat": "#D1872B", "film": "#B0425E"}
+MAP_CRS = ccrs.PlateCarree()
+MAP_DIR = ROOT / "utils"
+
+
+@lru_cache(maxsize=1)
+def china_features():
+    with shapefile.Reader(str(MAP_DIR / "china0.shp")) as reader:
+        outline = shape(reader.shape(0).__geo_interface__)
+    borders = []
+    for block in (MAP_DIR / "CN-border-La.gmt").read_text(encoding="utf-8").split(">"):
+        values = np.fromstring(block, sep=" ")
+        if values.size >= 4 and values.size % 2 == 0:
+            line = LineString(values.reshape(-1, 2)).simplify(0.06)
+            borders.append(np.asarray(line.coords))
+    return outline, borders
+
+
+def china_panel(ax, field, valid, *, vmin, vmax, cmap, stipple=None,
+                show_x=True, show_y=True):
+    lon = np.linspace(70, 140, field.shape[1])
+    lat = np.linspace(60, 0, field.shape[0])
+    outline, borders = china_features()
+    ax.set_extent((70, 140, 10, 60), crs=MAP_CRS)
+    ax.set_facecolor("white")
+    image = ax.pcolormesh(lon, lat, np.ma.masked_invalid(np.where(valid, field, np.nan)),
+                          transform=MAP_CRS, cmap=cmap, vmin=vmin, vmax=vmax,
+                          shading="nearest", rasterized=True, zorder=1)
+    clip = maskout.shp2clip(image, ax, str(MAP_DIR / "china0.shp"))
+    ax.add_geometries([outline], MAP_CRS, facecolor="none", edgecolor="#24282B",
+                      linewidth=0.5, zorder=3)
+    ax.add_collection(LineCollection(borders, colors="#41484C", linewidths=0.24,
+                                     transform=MAP_CRS, zorder=4))
+    if stipple is not None:
+        yy, xx = np.where(stipple[::5, ::5] & valid[::5, ::5])
+        dots = ax.scatter(lon[::5][xx], lat[::5][yy], s=1.5, c="black", alpha=0.7,
+                          transform=MAP_CRS, rasterized=True, zorder=5)
+        dots.set_clip_path(clip)
+    ax.set_xticks((80, 100, 120, 140), crs=MAP_CRS)
+    ax.set_yticks((20, 40, 60), crs=MAP_CRS)
+    ax.xaxis.set_major_formatter(LongitudeFormatter())
+    ax.yaxis.set_major_formatter(LatitudeFormatter())
+    ax.tick_params(labelsize=7, length=2, labelbottom=show_x, labelleft=show_y)
+
+    inset = ax.inset_axes((0.765, 0.02, 0.225, 0.29), projection=MAP_CRS)
+    inset.set_extent((105, 125, 0, 25), crs=MAP_CRS)
+    inset.set_facecolor("white")
+    inset.add_geometries([outline], MAP_CRS, facecolor="#F4F5F3",
+                         edgecolor="#41484C", linewidth=0.35)
+    inset.add_collection(LineCollection(borders, colors="#41484C", linewidths=0.28,
+                                        transform=MAP_CRS))
+    inset.set_xticks([])
+    inset.set_yticks([])
+    for spine in inset.spines.values():
+        spine.set_edgecolor("#80888C")
+        spine.set_linewidth(0.45)
+    return image
+
+
+def spatial_figures(test, dates, obs, valid, figures, delivery):
+    tcc = {}
+    pval = {}
+    for name in ORDER:
+        tcc[name], pval[name] = compute_tcc_and_p(test[name], obs, valid)
+    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.8),
+                             subplot_kw={"projection": MAP_CRS}, constrained_layout=True)
+    for i, (ax, name) in enumerate(zip(axes.flat, ORDER)):
+        im = china_panel(ax, tcc[name], valid, vmin=-0.8, vmax=0.8,
+                         cmap="RdBu_r", stipple=pval[name] < 0.05,
+                         show_x=i >= 2, show_y=i % 2 == 0)
+        ax.set_title(f"{LABEL[name]} (mean {np.nanmean(tcc[name]):.3f})", fontsize=10)
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.75,
+                 location="bottom", label="Temporal correlation")
+    fig.suptitle("Gridwise temporal correlation (21 months; descriptive)")
+    save(fig, "Fig3_temporal_corr", figures, delivery)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.7),
+                             subplot_kw={"projection": MAP_CRS}, constrained_layout=True)
+    for i, (ax, right) in enumerate(zip(axes, ("baseline", "eof_cat"))):
+        difference = tcc["film"] - tcc[right]
+        im = china_panel(ax, difference, valid, vmin=-0.5, vmax=0.5,
+                         cmap="RdBu_r", show_y=i == 0)
+        ax.set_title(f"FiLM - {LABEL[right]} (mean {np.nanmean(difference):+.3f})",
+                     fontsize=10)
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.75,
+                 location="bottom", label="TCC difference")
+    save(fig, "Fig4_TCC_difference", figures, delivery)
+
+    representative = ("2023-01", "2023-04", "2023-07", "2023-10")
+    fields = (("Observation", obs),) + tuple((LABEL[name], test[name]) for name in ORDER)
+    fig, axes = plt.subplots(4, 5, figsize=(13.5, 11.3),
+                             subplot_kw={"projection": MAP_CRS}, constrained_layout=True)
+    for row, month in enumerate(representative):
+        index = int(np.flatnonzero(dates == np.datetime64(month, "M"))[0])
+        for col, (label, values) in enumerate(fields):
+            ax = axes[row, col]
+            image = china_panel(ax, values[index], valid, vmin=-1.5, vmax=1.5,
+                                cmap="BrBG", show_x=row == 3, show_y=col == 0)
+            if row == 0:
+                ax.set_title(label, fontsize=10)
+            if col == 0:
+                ax.text(-0.13, 0.5, month, rotation=90, va="center", ha="right",
+                        transform=ax.transAxes, fontsize=8)
+    fig.colorbar(image, ax=axes.ravel().tolist(), location="bottom", shrink=0.75,
+                 label="Fractional precipitation anomaly (display clipped to [-1.5, 1.5])")
+    save(fig, "Fig5_spatial_examples", figures, delivery)
 
 
 def save(fig, name, figures, delivery):
@@ -39,21 +151,31 @@ def main():
     parser.add_argument("--experiment", default="revision06_eval_v2")
     parser.add_argument("--sensitivity", default="revision06_bicubic_v1")
     parser.add_argument("--delivery", required=True)
+    parser.add_argument("--spatial-only", action="store_true")
     args = parser.parse_args()
     paths = SubprojectPaths(__file__)
     source = paths.results_dir / args.experiment
     sensitivity = paths.results_dir / args.sensitivity
-    metrics = json.loads((source / "metrics.json").read_text(encoding="utf-8"))
-    alt = json.loads((sensitivity / "metrics.json").read_text(encoding="utf-8"))
-    if not ("bilinear" in metrics["protocol"]["seas5"] and
-            "bicubic" in alt["protocol"]["seas5"]):
-        raise ValueError("main/sensitivity source order is incorrect")
     delivery = Path(args.delivery)
     figures = source / "figures"
     figures.mkdir(parents=True, exist_ok=True)
     delivery.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
                          "axes.spines.top": False, "axes.spines.right": False})
+
+    if args.spatial_only:
+        with np.load(source / "test_predictions.npz", allow_pickle=True) as data:
+            test = {key: data[key].copy() for key in data.files}
+        dates = np.asarray(test["dates"], dtype="datetime64[M]")
+        spatial_figures(test, dates, test["target"], test["valid"].astype(bool),
+                        figures, delivery)
+        return
+
+    metrics = json.loads((source / "metrics.json").read_text(encoding="utf-8"))
+    alt = json.loads((sensitivity / "metrics.json").read_text(encoding="utf-8"))
+    if not ("bilinear" in metrics["protocol"]["seas5"] and
+            "bicubic" in alt["protocol"]["seas5"]):
+        raise ValueError("main/sensitivity source order is incorrect")
 
     rows = []
     for period in ("validation", "test"):
@@ -113,66 +235,7 @@ def main():
     fig.suptitle("Evaluation period: January 2023-September 2024 (21 months)")
     save(fig, "Fig2_metric_tradeoff", figures, delivery)
 
-    tcc = {}
-    pval = {}
-    for name in ORDER:
-        tcc[name], pval[name] = compute_tcc_and_p(test[name], obs, valid)
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.5), sharex=True, sharey=True,
-                             constrained_layout=True)
-    for ax, name in zip(axes.flat, ORDER):
-        im = ax.imshow(np.where(valid, tcc[name], np.nan), cmap="RdBu_r",
-                       vmin=-0.8, vmax=0.8, origin="upper", extent=(70, 140, 0, 60))
-        ax.set_title(f"{LABEL[name]} (mean {np.nanmean(tcc[name]):.3f})")
-        ax.set_xlim(70, 140)
-        ax.set_ylim(10, 60)
-        ax.set_xlabel("Longitude (degrees E)")
-        ax.set_ylabel("Latitude (degrees N)")
-        points = np.where((pval[name][::5, ::5] < 0.05) & valid[::5, ::5])
-        ax.scatter(70 + points[1] * 2.5, 60 - points[0] * 2.5,
-                   s=1.3, c="black", alpha=0.5, rasterized=True)
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.72,
-                 location="bottom", label="Temporal correlation")
-    fig.suptitle("Gridwise temporal correlation (21 months; descriptive)")
-    save(fig, "Fig3_temporal_corr", figures, delivery)
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.3), sharex=True, sharey=True,
-                             constrained_layout=True)
-    for ax, right in zip(axes, ("baseline", "eof_cat")):
-        left = "film"
-        difference = tcc[left] - tcc[right]
-        im = ax.imshow(np.where(valid, difference, np.nan), cmap="RdBu_r",
-                       vmin=-0.5, vmax=0.5, origin="upper", extent=(70, 140, 0, 60))
-        ax.set_title(f"FiLM - {LABEL[right]} (mean {np.nanmean(difference):+.3f})")
-        ax.set_xlim(70, 140)
-        ax.set_ylim(10, 60)
-        ax.set_xlabel("Longitude (degrees E)")
-        ax.set_ylabel("Latitude (degrees N)")
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.7,
-                 location="bottom", label="TCC difference")
-    save(fig, "Fig4_TCC_difference", figures, delivery)
-
-    representative = ("2023-01", "2023-04", "2023-07", "2023-10")
-    fields = (("Observation", obs),) + tuple((LABEL[name], test[name]) for name in ORDER)
-    fig, axes = plt.subplots(4, 5, figsize=(13.5, 10), sharex=True, sharey=True,
-                             constrained_layout=True)
-    for row, month in enumerate(representative):
-        index = int(np.flatnonzero(dates == np.datetime64(month, "M"))[0])
-        for col, (label, values) in enumerate(fields):
-            ax = axes[row, col]
-            image = ax.imshow(np.where(valid, values[index], np.nan),
-                              cmap="BrBG", vmin=-1.5, vmax=1.5,
-                              extent=(70, 140, 0, 60))
-            ax.set_xlim(70, 140)
-            ax.set_ylim(10, 60)
-            if row == 0:
-                ax.set_title(label)
-            if col == 0:
-                ax.set_ylabel(month + "\nLatitude (N)")
-            if row == 3:
-                ax.set_xlabel("Longitude (E)")
-    fig.colorbar(image, ax=axes.ravel().tolist(), location="bottom", shrink=0.75,
-                 label="Fractional precipitation anomaly (display clipped to [-1.5, 1.5])")
-    save(fig, "Fig5_spatial_examples", figures, delivery)
+    spatial_figures(test, dates, obs, valid, figures, delivery)
 
     ablation_file = paths.results_dir / "revision06_ablation_v1" / "ablation.json"
     if ablation_file.exists():
