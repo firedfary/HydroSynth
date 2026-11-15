@@ -116,11 +116,17 @@ class UNetLiteFiLM(nn.Module):
                  base_filters=32, dropout=0.2, bilinear=True, index_hidden=64,
                  film_layers=None, identity_init=False, zero_pc_identity=False,
                  reference_zero_dims=None, affine_mode="full", spatial_film=False,
-                 spatial_per_channel=False):
+                 spatial_per_channel=False, modulation_bound=None):
         super(UNetLiteFiLM, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        # ``modulation_bound`` keeps every conditioning coefficient inside
+        # [-bound, bound] through a tanh squash. ``None`` reproduces the
+        # unconstrained behaviour of all previously reported experiments.
+        if modulation_bound is not None and not modulation_bound > 0:
+            raise ValueError("modulation_bound must be positive or None")
+        self.modulation_bound = modulation_bound
         self.film_layers = frozenset(range(5) if film_layers is None else film_layers)
         self.zero_pc_identity = zero_pc_identity
         self.reference_zero_dims = index_dim if reference_zero_dims is None else reference_zero_dims
@@ -207,6 +213,10 @@ class UNetLiteFiLM(nn.Module):
             betas = [torch.zeros_like(beta) for beta in betas]
         elif self.affine_mode == "shift":
             gammas = [torch.zeros_like(gamma) for gamma in gammas]
+        if self.modulation_bound is not None:
+            bound = self.modulation_bound
+            gammas = [bound * torch.tanh(gamma) for gamma in gammas]
+            betas = [bound * torch.tanh(beta) for beta in betas]
         if film_gain != 1.0:
             gammas = [gamma * film_gain for gamma in gammas]
             betas = [beta * film_gain for beta in betas]
